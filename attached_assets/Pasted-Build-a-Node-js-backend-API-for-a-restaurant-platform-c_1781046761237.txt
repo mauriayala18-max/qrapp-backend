@@ -1,0 +1,94 @@
+Build a Node.js backend API for a restaurant platform called "QR App". TypeScript, Express, connected to an EXISTING Supabase database (do NOT create tables, the database is already set up).
+
+PROJECT STRUCTURE (monorepo):
+/packages/backend/     → Node.js API (BUILD THIS NOW)
+/packages/shared/      → Shared TypeScript types (create with basic types)
+/packages/app/         → (empty folder, placeholder for future React Native app)
+/packages/panel/       → (empty folder, placeholder for future Next.js panel)
+
+BACKEND STRUCTURE:
+/packages/backend/
+  src/
+    index.ts              → Express app, middleware, route mounting
+    config/
+      supabase.ts         → Two Supabase clients: one with anon key (client-facing), one with service_role key (admin/server operations)
+      env.ts              → Environment variable validation
+    middleware/
+      auth.ts             → JWT verification, extract user id and role from token
+      errorHandler.ts     → Global error handler
+      rateLimiter.ts      → Rate limiting for public endpoints
+    modules/
+      auth/
+        auth.routes.ts    → Route definitions
+        auth.controller.ts → Request handling
+        auth.service.ts   → Business logic
+    types/
+      index.ts            → TypeScript interfaces
+
+TECH STACK:
+- Node.js + Express + TypeScript (strict mode)
+- @supabase/supabase-js (connect to external Supabase, NOT Replit's DB)
+- express-rate-limit
+- cors
+- helmet
+
+ENVIRONMENT VARIABLES (will be added to Replit Secrets):
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY
+- JWT_SECRET
+- PORT (default 3000)
+
+AUTH ENDPOINTS TO IMPLEMENT:
+
+POST /api/v1/auth/register
+- Receives: email, password, full_name, registration_source ('email')
+- Creates user in Supabase Auth
+- Creates profile row in public.users table (id matches auth.users id)
+- Returns: user profile + session token
+
+POST /api/v1/auth/login
+- Receives: email, password
+- Authenticates via Supabase Auth
+- Checks terms_version, returns flag if terms need re-acceptance
+- Returns: user profile + session token
+
+POST /api/v1/auth/social
+- Receives: provider ('google' or 'apple'), access_token
+- Authenticates via Supabase Auth OAuth
+- Creates or updates profile in public.users table
+- Returns: user profile + session token
+
+GET /api/v1/auth/me
+- Requires auth middleware
+- Returns current user profile from public.users table
+
+PATCH /api/v1/auth/me
+- Requires auth middleware
+- Updates user profile fields (full_name, phone, date_of_birth, dining_frequency, preferred_language, font_size, dark_mode)
+
+POST /api/v1/auth/employee/login
+- Receives: email, password
+- Authenticates via Supabase Auth
+- Validates user exists in employees table and is_active = true
+- Gets role and branch_ids from employees + employee_branches tables
+- Returns: employee profile + role + branch_ids + session token
+
+POST /api/v1/auth/terms/accept
+- Requires auth middleware
+- Receives: version
+- Updates users.terms_accepted_at and users.terms_version
+
+GET /api/v1/health
+- Public endpoint, returns { status: 'ok', timestamp }
+
+RULES:
+- All routes prefixed with /api/v1/
+- Rate limit auth endpoints: 10 requests per minute per IP
+- Error response format: { error: true, message: string, code: string }
+- Success response format: { data: any, message?: string }
+- Use service_role Supabase client for all server-side database operations
+- CORS enabled for all origins during development
+- Helmet for security headers
+- TypeScript strict mode
+- Do NOT create any database tables or migrations. The database already exists in Supabase with all tables.
