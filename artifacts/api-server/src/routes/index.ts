@@ -18,6 +18,7 @@ import couponsRouter from "./coupons.js";
 import ratingsRouter from "../modules/ratings/ratings.routes.js";
 import notificationsRouter from "../modules/notifications/notifications.routes.js";
 import panelModuleRouter from "../modules/panel/panel.routes.js";
+import adminRouter from "../modules/admin/admin.routes.js";
 
 const router: IRouter = Router();
 
@@ -45,5 +46,6 @@ router.use("/v1/promotions", promotionsRouter);
 router.use("/v1/coupons", couponsRouter);
 router.use("/v1/ratings", ratingsRouter);
 router.use("/v1/notifications", notificationsRouter);
+router.use("/v1/admin", adminRouter);
 
 export default router;

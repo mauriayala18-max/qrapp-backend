@@ -1,0 +1,144 @@
+Add the Super Admin module to the existing QR App backend. Do NOT modify or recreate existing files. Only add new module folders and register routes.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE: SUPER ADMIN (/api/v1/admin)
+Location: src/modules/admin/
+
+Create a new middleware: requireSuperAdmin
+- Validates Bearer token via Supabase Auth
+- Checks user exists in super_admins table and is_active = true
+- Attach super_admin info to request
+
+--- DASHBOARD ---
+
+GET /api/v1/admin/dashboard
+- Requires super admin auth
+- Returns ALL in single response using Promise.all:
+  - restaurants: { total, active, inactive, new_this_month }
+  - users: { total_registered, new_this_month, active_last_30_days, premium_count, web_to_app_conversion: users with registration after web session }
+  - operations: { orders_today, orders_this_week, orders_this_month, digital_vs_traditional_ratio, avg_ticket_today, peak_hour_today, cancellation_rate_this_month }
+  - financial: { commission_revenue_this_month (placeholder 0 for now), premium_subscription_revenue: sum of active subscriptions prices, total_billed_this_month (placeholder) }
+  - engagement: { avg_restaurant_rating, total_reviews_this_month, points_issued_this_month (sum earned from points_ledger), points_redeemed_this_month, coupons_issued_vs_used, reservations_made_vs_cancelled }
+
+--- RESTAURANT MANAGEMENT ---
+
+GET /api/v1/admin/restaurants
+- Returns paginated list of all restaurants with branches
+- Query params: ?status=active|inactive&cuisine_type=string&page=1&limit=20
+- Each: name, branch count, total orders, avg rating, plan, status
+
+POST /api/v1/admin/restaurants
+- Onboard new restaurant
+- Receives: { name, slug, description?, branches: [{ name, address, latitude, longitude, phone, operation_mode }] }
+- Creates restaurant + branches
+- Returns: created restaurant with branches
+
+PATCH /api/v1/admin/restaurants/:restaurantId/status
+- Receives: { action: 'activate' | 'deactivate' | 'suspend', deactivation_reason? }
+- Updates restaurant is_active and deactivation fields
+- Returns: updated restaurant
+
+--- CATALOG MANAGEMENT ---
+
+GET /api/v1/admin/catalogs/:catalogType
+- catalogType: 'dietary_restrictions' | 'cuisine_types' | 'banks' | 'card_levels' | 'card_networks' | 'languages' | 'waiter_call_reasons' | 'termination_reasons'
+- Returns all entries from the corresponding master_ table
+
+POST /api/v1/admin/catalogs/:catalogType
+- Receives: { name } (and { code, name } for languages)
+- Creates entry in corresponding master_ table
+- Returns: created entry
+
+PATCH /api/v1/admin/catalogs/:catalogType/:entryId
+- Updates name or is_active
+- Returns: updated entry
+
+--- PREMIUM MANAGEMENT ---
+
+GET /api/v1/admin/premium/plans
+- Returns all premium_plans
+
+POST /api/v1/admin/premium/plans
+- Receives: { name, price (Gs), billing_period, double_points, priority_reservations, direct_promo_access }
+- Creates premium_plan
+- Returns: created plan
+
+PATCH /api/v1/admin/premium/plans/:planId
+- Updates plan fields
+- Returns: updated plan
+
+GET /api/v1/admin/premium/subscriptions
+- Returns paginated active subscriptions with user info
+- Query params: ?status=active|cancelled|expired&page=1&limit=20
+
+--- SUPPORT TICKETS ---
+
+GET /api/v1/admin/support/tickets
+- Returns paginated tickets
+- Query params: ?status=open|in_progress|resolved|closed&priority=low|medium|high&page=1&limit=20
+
+GET /api/v1/admin/support/tickets/:ticketId
+- Returns ticket with all messages (from support_ticket_messages)
+
+PATCH /api/v1/admin/support/tickets/:ticketId
+- Receives: { status?, priority?, assigned_to? }
+- Updates ticket
+- Returns: updated ticket
+
+POST /api/v1/admin/support/tickets/:ticketId/messages
+- Receives: { message }
+- Creates support_ticket_messages with sender_type = 'super_admin'
+- Returns: created message
+
+--- PLATFORM ALERTS ---
+
+GET /api/v1/admin/alerts
+- Returns platform_alerts ordered by created_at DESC
+- Query params: ?status=pending|acknowledged|resolved&type=restaurant_inactive|low_rating|cancellation_spike|payment_problem
+
+PATCH /api/v1/admin/alerts/:alertId
+- Receives: { status: 'acknowledged' | 'resolved' }
+- Sets acknowledged_by = super_admin id
+- Returns: updated alert
+
+--- MASS COMMUNICATIONS ---
+
+GET /api/v1/admin/communications
+- Returns all mass_communications ordered by created_at DESC
+
+POST /api/v1/admin/communications
+- Receives: { target_type: 'all_users'|'all_restaurants'|'segment', segment_criteria?, title, body, channel: 'push'|'email'|'both' }
+- Creates mass_communications with status = 'draft'
+- Returns: created communication
+
+POST /api/v1/admin/communications/:communicationId/send
+- Sets status = 'sent', sent_at = now()
+- NOTE: Actual sending (push/email) will be integrated later. For now just update the status.
+- Returns: updated communication
+
+--- GLOBAL CONFIGURATION ---
+
+GET /api/v1/admin/config
+- Returns all global_configuration entries
+
+PATCH /api/v1/admin/config/:key
+- Receives: { value }
+- Updates the configuration entry
+- Logs change in audit_log (log_level: 'full', with old_value and new_value)
+- Returns: updated config entry
+
+--- AUDIT LOG ---
+
+GET /api/v1/admin/audit-log
+- Returns paginated audit_log entries
+- Query params: ?actor_type=user|employee|super_admin|system&module=string&log_level=full|simple&page=1&limit=50
+- Ordered by created_at DESC
+
+RULES:
+- Follow existing module patterns
+- Same error/success response format
+- Use supabaseAdmin for all DB operations
+- Dashboard must use Promise.all for parallel queries
+- Register routes in existing route setup
+- All super admin endpoints require the new requireSuperAdmin middleware
