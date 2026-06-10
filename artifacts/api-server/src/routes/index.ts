@@ -8,6 +8,9 @@ import branchesRouter from "./branches.js";
 import cancellationsRouter from "./cancellations.js";
 import productsRouter from "./products.js";
 import panelRouter from "./panel.js";
+import paymentsRouter from "../modules/payments/payments.routes.js";
+import splitsRouter from "./splits.js";
+import payRouter from "./pay.js";
 
 const router: IRouter = Router();
 
@@ -25,5 +28,8 @@ router.use("/v1/branches", branchesRouter);
 router.use("/v1/cancellations", cancellationsRouter);
 router.use("/v1/products", productsRouter);
 router.use("/v1/panel", panelRouter);
+router.use("/v1/payments", paymentsRouter);
+router.use("/v1/splits", splitsRouter);
+router.use("/v1/pay", payRouter);
 
 export default router;

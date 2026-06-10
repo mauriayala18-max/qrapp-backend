@@ -1,9 +1,10 @@
 import { Router, type IRouter } from "express";
 import { authenticate } from "../middleware/auth.js";
-import { requireEmployee } from "../middleware/employee.js";
+import { requireEmployee, optionalAuthenticate } from "../middleware/employee.js";
 import { getActiveOrders } from "../modules/orders/orders.controller.js";
 import { getBranchWaiterCalls } from "../modules/waiter-calls/waiter-calls.controller.js";
 import { getBranchMenu, searchMenu, getFeaturedProducts } from "../modules/menu/menu.controller.js";
+import { getBankingBenefits } from "../modules/payments/payments.controller.js";
 
 const router: IRouter = Router();
 
@@ -12,5 +13,6 @@ router.get("/:branchId/waiter-calls", authenticate, requireEmployee, getBranchWa
 router.get("/:branchId/menu", getBranchMenu);
 router.get("/:branchId/menu/search", searchMenu);
 router.get("/:branchId/menu/featured", getFeaturedProducts);
+router.get("/:branchId/banking-benefits", optionalAuthenticate, getBankingBenefits);
 
 export default router;

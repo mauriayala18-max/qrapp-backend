@@ -1,0 +1,116 @@
+Add the Payments module to the existing QR App backend. Do NOT modify or recreate existing files. Only add new module folders and register routes.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE: PAYMENTS (/api/v1/payments)
+Location: src/modules/payments/
+
+--- PAYMENT ENDPOINTS ---
+
+POST /api/v1/payments
+- Requires auth OR valid session participant
+- Receives: {
+    session_id,
+    amount (integer, Guaranies),
+    payment_method: 'card' | 'apple_pay' | 'google_pay' | 'pos' | 'cash',
+    card_id?: string (for saved cards),
+    banking_benefit_id?: string,
+    tip_amount?: integer,
+    tip_type?: 'digital' | 'cash',
+    billing_profile_id?: string
+  }
+- Validates: amount > 0, session exists, payment method is accepted by branch (check branch_payment_methods)
+- If banking_benefit_id provided: validate benefit is active, date is within valid_from/valid_until, day_of_week matches, calculate discount (percentage * amount, capped at cap_amount), set discount_amount
+- If payment_method is 'card' or 'apple_pay' or 'google_pay':
+    - For now, create payment record with status 'pending' and a placeholder for bancard_process_id
+    - NOTE: Actual Bancard vPOS integration will be added later. For MVP, simulate by immediately setting status to 'completed'
+- If payment_method is 'cash' or 'pos':
+    - Requires employee auth (waiter processes these)
+    - Creates payment with status 'completed' immediately
+- After payment completed: create payment_receipt with auto-generated receipt_number (format: "REC-{branch_short}-{timestamp}-{random4}")
+- Returns: payment record with receipt
+
+GET /api/v1/sessions/:sessionId/payments
+- Returns all payments for the session
+- Includes: who paid, amount, method, discount, tip, status, receipt
+- Also returns: total_ordered (sum of all order totals), total_paid (sum of completed payments), remaining balance
+
+GET /api/v1/payments/:paymentId/receipt
+- Returns receipt details for a specific payment
+
+--- ACCOUNT SPLIT ENDPOINTS ---
+
+POST /api/v1/sessions/:sessionId/split
+- Requires session participation
+- Receives: { split_method: 'equal' | 'choose_mine' | 'custom_amount', participants_count: integer }
+- Creates account_split record
+- If 'equal': calculates amount per person (total / participants_count, round up remainder to first person)
+- Returns: split details with calculated amounts per participant
+
+POST /api/v1/splits/:splitId/claim
+- For 'choose_mine' method only
+- Receives: { items: [{ order_item_id, is_shared?: boolean }] }
+- Requires valid session participant
+- Creates claimed_items records
+- If is_shared: increments share_count on existing claimed_item
+- Validates item isn't already fully claimed by someone else (unless shared)
+- Returns: updated claims list with participant names next to each item
+
+GET /api/v1/splits/:splitId
+- Returns split details:
+  - Split method
+  - All order items organized by category (drinks, food, desserts, other based on menu_categories)
+  - Each item shows: product name, price, claimed_by (participant name), is_shared, share_count
+  - Summary: total per participant
+
+--- PAYMENT LINK ENDPOINTS ---
+
+POST /api/v1/sessions/:sessionId/payment-link
+- Requires session participation
+- Receives: { amount: integer }
+- Generates unique URL (format: "https://qrapp.com/pay/{uuid}")
+- Creates payment_link record with expiry (get minutes from global_configuration 'payment_link_expiry_minutes')
+- Returns: { url, amount, expires_at }
+
+GET /api/v1/pay/:linkId
+- Public endpoint
+- Returns: payment link details (amount, status, session info, restaurant name)
+- If expired or used: return appropriate error
+
+POST /api/v1/pay/:linkId/complete
+- Public (or auth optional)
+- Receives: { payment_method, card_id? }
+- Validates link is active and not expired
+- Creates payment record using the link's amount
+- Marks link as 'used'
+- Returns: payment with receipt
+
+--- INVOICE ENDPOINTS ---
+
+POST /api/v1/sessions/:sessionId/invoice
+- Requires session participation or employee auth
+- Receives: { billing_profile_id?, customer_name?, ruc? }
+- Checks branch.allows_split_invoice to determine if individual invoices are allowed
+- Validates total payments cover total orders (can only invoice when fully paid)
+- Creates invoice with auto-generated invoice_number (format: "INV-{branch_short}-{YYYYMMDD}-{sequential}")
+- invoice_type based on branch config: 'single' if split not allowed, 'individual' if allowed and requested
+- Returns: invoice details
+
+GET /api/v1/sessions/:sessionId/invoice
+- Returns invoice(s) for the session
+
+--- BANKING BENEFIT HELPER ---
+
+GET /api/v1/branches/:branchId/banking-benefits
+- Public
+- Returns active banking benefits for the branch
+- Filters: valid_from <= today, valid_until >= today, is_active = true, day matches current day_of_week
+- If user is authenticated and has saved cards: highlights which benefits apply to their cards (match bank_name and card_level from user_cards)
+
+RULES:
+- Follow existing module patterns (routes → controller → service)
+- Same error/success response format
+- Use supabaseAdmin for all DB operations
+- All monetary amounts are integers in Guaranies (no decimals)
+- Bancard integration is placeholder for now — simulate successful payment
+- Register routes in existing route setup
