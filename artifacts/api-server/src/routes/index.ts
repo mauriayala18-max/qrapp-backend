@@ -11,6 +11,10 @@ import panelRouter from "./panel.js";
 import paymentsRouter from "../modules/payments/payments.routes.js";
 import splitsRouter from "./splits.js";
 import payRouter from "./pay.js";
+import reservationsRouter from "../modules/reservations/reservations.routes.js";
+import pointsRouter from "../modules/points/points.routes.js";
+import promotionsRouter from "../modules/promotions/promotions.routes.js";
+import couponsRouter from "./coupons.js";
 
 const router: IRouter = Router();
 
@@ -31,5 +35,9 @@ router.use("/v1/panel", panelRouter);
 router.use("/v1/payments", paymentsRouter);
 router.use("/v1/splits", splitsRouter);
 router.use("/v1/pay", payRouter);
+router.use("/v1/reservations", reservationsRouter);
+router.use("/v1/points", pointsRouter);
+router.use("/v1/promotions", promotionsRouter);
+router.use("/v1/coupons", couponsRouter);
 
 export default router;

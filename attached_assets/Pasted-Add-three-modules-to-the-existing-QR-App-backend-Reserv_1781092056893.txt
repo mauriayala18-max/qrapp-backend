@@ -1,0 +1,136 @@
+Add three modules to the existing QR App backend: Reservations, Points/Rewards, and Promotions/Coupons. Do NOT modify or recreate existing files. Only add new module folders and register routes.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE 1: RESERVATIONS (/api/v1/reservations)
+Location: src/modules/reservations/
+
+POST /api/v1/reservations
+- Requires auth (app users only)
+- Receives: { branch_id, date, time, party_size, special_requests? }
+- Validates: date is not in the past, branch exists and is_active
+- Creates reservation with status 'pending'
+- Returns: reservation details
+
+GET /api/v1/reservations/mine
+- Requires auth
+- Returns user's reservations ordered by date DESC
+- Query params: ?status=pending|confirmed|completed&upcoming=true (upcoming = date >= today)
+
+GET /api/v1/panel/branches/:branchId/reservations
+- Requires auth + employee role (admin or manager)
+- Returns reservations for the branch
+- Query params: ?date=YYYY-MM-DD&status=pending|confirmed
+
+PATCH /api/v1/panel/reservations/:reservationId
+- Requires auth + employee role (admin or manager)
+- Receives: { status: 'confirmed' | 'rejected' | 'cancelled' | 'completed' | 'no_show', rejection_reason? }
+- Sets confirmed_by if confirming
+- Returns: updated reservation
+
+DELETE /api/v1/reservations/:reservationId
+- Requires auth (owner of reservation)
+- Only if status is 'pending' or 'confirmed'
+- Sets status = 'cancelled'
+
+MODULE 2: POINTS & REWARDS (/api/v1/points)
+Location: src/modules/points/
+
+GET /api/v1/points/balance
+- Requires auth
+- Returns: { balance: users.points_balance, level: users.points_level }
+
+GET /api/v1/points/history
+- Requires auth
+- Returns paginated points_ledger for the user
+- Query params: ?page=1&limit=20&type=earned|redeemed|expired
+
+POST /api/v1/points/earn
+- Internal service function (called by other modules, not a public endpoint exposed to clients)
+- Used after: order completed, review submitted, onboarding, restaurant rating
+- Receives: { user_id, amount, reason, reference_type, reference_id }
+- Creates points_ledger entry with type 'earned'
+- Updates users.points_balance (increment)
+- Calculates balance_after
+- If user is premium: double the points (check is_premium flag)
+- Returns: ledger entry
+
+POST /api/v1/points/redeem
+- Requires auth
+- Receives: { amount, reason, reference_type, reference_id }
+- Validates: user has enough balance
+- Creates points_ledger entry with type 'redeemed' (negative amount)
+- Updates users.points_balance (decrement)
+- Returns: ledger entry
+
+IMPORTANT: Export the earn function from the points service so other modules can call it:
+- After order delivered → earn points (configurable amount from global_configuration)
+- After review submitted → earn points (global_configuration 'review_points')
+- After restaurant rating → earn points (global_configuration 'rating_points')
+- After onboarding → earn points (global_configuration 'onboarding_points')
+
+MODULE 3: PROMOTIONS & COUPONS (/api/v1/promotions)
+Location: src/modules/promotions/
+
+--- CLIENT ENDPOINTS ---
+
+GET /api/v1/branches/:branchId/promotions
+- Public
+- Returns active promotions for the branch (is_active, valid_from <= now, valid_until >= now)
+- If user is authenticated: filter by segment_targeting matching user profile (all, new, frequent, inactive, premium)
+- Each promotion shows: name, description, conditions_text, type, value, requires_points, points_cost
+
+POST /api/v1/promotions/:promotionId/apply
+- Requires auth
+- Receives: { order_id }
+- Validates: promotion is active, within dates, user matches segment, max_uses not reached
+- If requires_points: validate user has enough points and redeem them
+- Creates promotion_usage record
+- Increments promotion.current_uses
+- Returns: { discount_applied, promotion details }
+
+GET /api/v1/coupons/mine
+- Requires auth
+- Returns user's coupons with status (active, used, expired)
+
+POST /api/v1/coupons/:couponId/apply
+- Requires auth (owner of coupon)
+- Receives: { order_id }
+- Validates: coupon is active, not expired, belongs to user
+- Calculates discount based on coupon_type (percentage with cap, or fixed_amount)
+- Updates coupon: status = 'used', used_at, order_id
+- Returns: { discount_applied }
+
+--- PANEL ENDPOINTS ---
+
+POST /api/v1/panel/branches/:branchId/promotions
+- Requires auth + employee role (admin)
+- Receives: { name, description, conditions_text, promotion_type, value, min_order_amount?, segment_targeting, is_featured, requires_points, points_cost, valid_from, valid_until, max_uses? }
+- Creates promotion
+- Returns: created promotion
+
+PATCH /api/v1/panel/promotions/:promotionId
+- Requires auth + employee role (admin)
+- Updates promotion fields
+- Returns: updated promotion
+
+DELETE /api/v1/panel/promotions/:promotionId
+- Soft delete: is_active = false
+
+POST /api/v1/panel/branches/:branchId/coupons
+- Requires auth + employee role (admin or manager)
+- Receives: { user_id, coupon_type, value, cap_amount?, expires_at, reason }
+- Generates unique code (format: "QR-{RANDOM6}")
+- Creates coupon
+- Returns: created coupon with code
+
+GET /api/v1/panel/branches/:branchId/promotions/stats
+- Requires auth + employee role (admin)
+- Returns: each promotion with current_uses, total discount given (sum from promotion_usage), conversion rate
+
+RULES:
+- Follow existing module patterns
+- Same error/success response format
+- Use supabaseAdmin for all DB operations
+- Points amounts read from global_configuration table
+- Register routes in existing route setup
