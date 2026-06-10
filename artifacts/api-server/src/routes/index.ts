@@ -17,6 +17,7 @@ import promotionsRouter from "../modules/promotions/promotions.routes.js";
 import couponsRouter from "./coupons.js";
 import ratingsRouter from "../modules/ratings/ratings.routes.js";
 import notificationsRouter from "../modules/notifications/notifications.routes.js";
+import panelModuleRouter from "../modules/panel/panel.routes.js";
 
 const router: IRouter = Router();
 
@@ -34,6 +35,7 @@ router.use("/v1/branches", branchesRouter);
 router.use("/v1/cancellations", cancellationsRouter);
 router.use("/v1/products", productsRouter);
 router.use("/v1/panel", panelRouter);
+router.use("/v1/panel", panelModuleRouter);
 router.use("/v1/payments", paymentsRouter);
 router.use("/v1/splits", splitsRouter);
 router.use("/v1/pay", payRouter);

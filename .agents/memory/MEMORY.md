@@ -1,0 +1,1 @@
+- [QR App Supabase backend](qr-app-supabase.md) — service_role grant gotchas, role gating via requireRole, module pattern for artifacts/api-server.

@@ -1,0 +1,163 @@
+Add the remaining Restaurant Panel module to the existing QR App backend. Some panel endpoints already exist in other modules (menu, orders, reservations, reviews, promotions). This adds: Dashboard, Statistics, Employee Management, Client Data, and Branch Configuration. Do NOT modify existing files except to add route imports.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE: RESTAURANT PANEL (/api/v1/panel)
+Location: src/modules/panel/
+
+--- DASHBOARD ---
+
+GET /api/v1/panel/branches/:branchId/dashboard
+- Requires auth + employee role (admin or manager)
+- Returns ALL of the following in a single response:
+  - active_tables: count of table_sessions with status = 'active' for this branch
+  - orders_in_progress: count of orders with status IN ('received', 'in_preparation') for this branch
+  - daily_revenue: sum of completed payments for today
+  - completed_orders_today: count of orders with status = 'delivered' today
+  - todays_reservations: count of reservations for today with status IN ('pending', 'confirmed')
+  - pending_alerts: count of restaurant_alerts with status = 'pending'
+  - recent_orders: last 5 orders with table_number, status, total_amount, created_at
+
+--- STATISTICS ---
+
+GET /api/v1/panel/branches/:branchId/statistics
+- Requires auth + employee role (admin)
+- Query params: ?period=today|week|month|custom&from=YYYY-MM-DD&to=YYYY-MM-DD
+- Returns:
+  - sales_total: sum of completed payments in period
+  - order_count: total orders in period
+  - average_ticket: sales_total / order_count
+  - top_products: top 10 products by quantity ordered, with revenue per product
+  - bottom_products: bottom 5 products by quantity ordered
+  - peak_hours: orders grouped by hour of day, showing count per hour
+  - orders_by_type: count grouped by order_type (digital, traditional, offline, anticipatory)
+  - new_vs_returning: count of unique users who ordered, split by first visit vs returning (based on previous orders at this branch)
+  - average_rating: avg from restaurant_ratings in period
+  - cancellation_rate: cancelled orders / total orders as percentage
+
+--- EMPLOYEE MANAGEMENT ---
+
+GET /api/v1/panel/branches/:branchId/employees
+- Requires auth + employee role (admin)
+- Returns all employees linked to this branch via employee_branches
+- Includes: id, full_name, email, phone, role, is_active
+
+POST /api/v1/panel/branches/:branchId/employees
+- Requires auth + employee role (admin)
+- Receives: { full_name, email, password, phone?, role: 'admin'|'manager'|'kitchen'|'waiter' }
+- Creates user in Supabase Auth (email + password)
+- Creates employee record with auth_user_id
+- Creates employee_branches link
+- Returns: created employee
+
+PATCH /api/v1/panel/employees/:employeeId
+- Requires auth + employee role (admin)
+- Receives: partial fields (full_name, phone, role)
+- Updates employee record
+- Returns: updated employee
+
+POST /api/v1/panel/employees/:employeeId/deactivate
+- Requires auth + employee role (admin)
+- Receives: { termination_reason_id }
+- Sets is_active = false, termination_reason_id, terminated_at
+- Returns: updated employee
+
+POST /api/v1/panel/employees/:employeeId/reactivate
+- Requires auth + employee role (admin)
+- Sets is_active = true, clears termination fields
+- Returns: updated employee
+
+GET /api/v1/panel/branches/:branchId/waiter-assignments
+- Requires auth + employee role (admin or manager)
+- Returns current active table-waiter assignments
+
+POST /api/v1/panel/branches/:branchId/waiter-assignments
+- Requires auth + employee role (admin or manager)
+- Receives: { employee_id, table_ids: string[] }
+- Deactivates previous assignments for this employee
+- Creates new table_waiter_assignments for each table
+- Returns: assignments
+
+--- CLIENT DATA ---
+
+GET /api/v1/panel/branches/:branchId/clients
+- Requires auth + employee role (admin)
+- Returns clients who have visited this branch (via orders/sessions)
+- Each client: full_name, total_visits, total_orders, total_spent, last_visit, average_rating_given
+- Query params: ?segment=frequent|new|inactive&page=1&limit=20
+  - frequent: 5+ orders at this branch
+  - new: first order in last 30 days
+  - inactive: no orders in last 60 days
+
+GET /api/v1/panel/clients/:userId/profile
+- Requires auth + employee role (admin)
+- Returns client detail for this branch: visit history, orders, ratings given, total spent, favorite products
+
+--- BRANCH CONFIGURATION ---
+
+GET /api/v1/panel/branches/:branchId/settings
+- Requires auth + employee role (admin)
+- Returns full branch configuration: name, address, coordinates, phone, operation_mode, pickup_enabled, advance_order_enabled, allows_split_invoice, hours, photos, payment_methods
+
+PATCH /api/v1/panel/branches/:branchId/settings
+- Requires auth + employee role (admin)
+- Receives: partial fields to update (name, address, latitude, longitude, phone, operation_mode, pickup_enabled, advance_order_enabled, allows_split_invoice)
+- Updates branch record
+- Logs change in audit_log
+- Returns: updated settings
+
+PUT /api/v1/panel/branches/:branchId/hours
+- Requires auth + employee role (admin)
+- Receives: { hours: [{ day_of_week, open_time, close_time, is_closed }] }
+- Replaces all branch_hours for this branch (delete existing, insert new)
+- Returns: updated hours
+
+POST /api/v1/panel/branches/:branchId/photos
+- Requires auth + employee role (admin)
+- Receives: { photo_url, is_logo?, display_order? }
+- Creates branch_photos record
+- Returns: photo record
+
+DELETE /api/v1/panel/photos/:photoId
+- Requires auth + employee role (admin)
+- Deletes branch_photos record
+
+PUT /api/v1/panel/branches/:branchId/payment-methods
+- Requires auth + employee role (admin)
+- Receives: { methods: [{ payment_method, is_enabled }] }
+- Upserts branch_payment_methods
+- Returns: updated methods
+
+GET /api/v1/panel/branches/:branchId/tables
+- Requires auth + employee role (admin or manager)
+- Returns all tables for the branch with current session status
+
+POST /api/v1/panel/branches/:branchId/tables
+- Requires auth + employee role (admin)
+- Receives: { table_number, capacity? }
+- Creates table with auto-generated QR code URL and initial token/PIN
+- Returns: created table
+
+PATCH /api/v1/panel/tables/:tableId
+- Requires auth + employee role (admin)
+- Update capacity or deactivate
+
+--- ALERTS ---
+
+GET /api/v1/panel/branches/:branchId/alerts
+- Requires auth + employee role
+- Returns alerts filtered by employee's role
+- Query params: ?status=pending|acknowledged|resolved
+- Ordered by created_at DESC
+
+PATCH /api/v1/panel/alerts/:alertId
+- Requires auth + employee role
+- Receives: { status: 'acknowledged' | 'resolved' }
+- Updates alert with who acknowledged/resolved and timestamps
+
+RULES:
+- Follow existing module patterns
+- Same error/success response format
+- Use supabaseAdmin for all DB operations
+- Dashboard endpoint must be optimized — use Promise.all for parallel queries
+- Register routes in existing route setup
