@@ -1,0 +1,145 @@
+Add two new modules to the existing QR App backend: Table Sessions and Orders. Do NOT modify or recreate existing files (auth, middleware, config). Only add new module folders and register their routes in the existing router.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE 1: TABLE SESSIONS (/api/v1/sessions)
+Location: src/modules/sessions/
+
+Endpoints:
+
+POST /api/v1/sessions/join
+- Public (no auth required for web guests, optional auth for app users)
+- Receives: { token?: string, pin?: string, name?: string, platform: 'app' | 'web' }
+- If token provided: validates against tables.current_session_token
+- If pin provided: validates against tables.current_pin
+- If user is authenticated (has Bearer token), use their user_id
+- If not authenticated, require name (web guest)
+- Finds or creates active table_session for that table
+- Creates session_participant record (user_id or web_name, connection_method qr/pin, platform)
+- Returns: { session_id, table_number, branch info (name, address), restaurant name, participants list }
+
+GET /api/v1/sessions/:sessionId
+- Requires auth OR valid participant check
+- Returns: session details + participants + all orders with items + table info
+
+GET /api/v1/sessions/:sessionId/participants
+- Returns list of participants with their names and connection info
+
+POST /api/v1/sessions/:sessionId/close
+- Requires auth + employee role
+- Validates all payments are completed (total orders amount = total payments)
+- Sets session status = 'closed', closed_at = now(), closed_by = employee id
+- Generates new token and PIN on the table for next session
+- Returns: { success: true }
+
+POST /api/v1/sessions/scan
+- Combined endpoint for QR scan (optimized, single call)
+- Receives: { token: string, platform: 'app' | 'web', name?: string }
+- Validates token, joins session, and returns ALL data needed for the client in one response:
+  - session info (id, status, table_number)
+  - restaurant info (name, logo, branch name, address, operation_mode)
+  - menu (categories with products, current time slot highlighted)
+  - existing orders in this session
+  - participants list
+  - active promotions for this branch
+  - banking benefits (if user is authenticated and has saved cards)
+
+MODULE 2: ORDERS (/api/v1/orders)
+Location: src/modules/orders/
+
+Endpoints:
+
+POST /api/v1/orders
+- Requires session participation (authenticated user in session OR valid participant)
+- Receives: { session_id, items: [{ product_id, quantity, notes?, modifications?: [{ option_id }] }], notes? }
+- Validates all products exist, are available, belong to the session's branch
+- Calculates prices (unit_price from products table at time of order, modifications additional_price)
+- Creates order (type: 'digital', status: 'received')
+- Creates order_items with individual prices
+- Creates order_item_modifications
+- Calculates and sets order.total_amount
+- Returns: created order with items
+
+POST /api/v1/orders/traditional
+- Requires auth + employee role (waiter)
+- Receives: { session_id, items: [{ product_id, quantity, notes?, modifications?: [{ option_id }] }], notes? }
+- Same logic as above but order_type = 'traditional'
+- Records which employee created it
+
+POST /api/v1/orders/anticipatory
+- Requires auth (app user only)
+- Receives: { branch_id, order_type: 'anticipatory_dine_in' | 'anticipatory_pickup', requested_time, items: [...], notes? }
+- No session_id required (created before arriving)
+- Validates branch exists and has advance orders enabled (advance_order_enabled or pickup_enabled)
+- Returns: created order
+
+POST /api/v1/orders/:orderId/link
+- Requires auth + employee role
+- Links an anticipatory order to an active session
+- Receives: { session_id }
+- Sets order.session_id and order.is_linked = true
+- Returns: updated order
+
+GET /api/v1/orders/:orderId
+- Returns order with all items, modifications, and status timestamps
+
+GET /api/v1/branches/:branchId/orders/active
+- Requires auth + employee role
+- Returns all active orders (not delivered, not cancelled) for the branch
+- Ordered by received_at ASC (oldest first)
+- Includes table_number, items with status, modifications
+- This is the KITCHEN and WAITER view
+
+PATCH /api/v1/orders/:orderId/items/:itemId/status
+- Requires auth + employee role (kitchen or waiter)
+- Receives: { status: 'in_preparation' | 'ready' | 'cancelled' }
+- Updates individual item status
+- If all items in order are 'ready', auto-update order status to 'ready'
+- Updates corresponding timestamp (in_preparation_at, ready_at, cancelled_at)
+
+PATCH /api/v1/orders/:orderId/status
+- Requires auth + employee role
+- Receives: { status: 'ready' | 'delivered' }
+- Bulk update: sets ALL items to that status too
+- Updates order timestamps
+
+POST /api/v1/orders/:orderId/cancel
+- If order status is 'received': cancel immediately, set status = 'cancelled'
+- If order status is 'in_preparation': create cancellation_request (status: 'pending'), return message "Your waiter will come to confirm"
+- If order status is 'ready': reject, return error "Cannot cancel completed orders"
+- Receives: { reason?: string, item_id?: string } (item_id if cancelling specific item)
+
+PATCH /api/v1/cancellations/:requestId
+- Requires auth + employee role (waiter)
+- Receives: { status: 'approved' | 'rejected', rejection_reason?: string }
+- If approved: cancel the order/item
+- If rejected: log rejection_reason
+- Sets resolved_by and resolved_at
+
+MODULE 3: WAITER CALLS (/api/v1/waiter-calls)
+Location: src/modules/waiter-calls/
+
+POST /api/v1/sessions/:sessionId/call-waiter
+- Requires session participation
+- Receives: { reason_id?: string, custom_reason?: string }
+- Creates waiter_call record
+- Creates restaurant_alert (type: 'client_calling', recipient_role: 'waiter')
+- Returns: { call_id, status: 'pending' }
+
+GET /api/v1/branches/:branchId/waiter-calls
+- Requires auth + employee role
+- Returns pending and acknowledged calls for the branch
+- Includes table_number, participant name, reason, time elapsed
+
+PATCH /api/v1/waiter-calls/:callId
+- Requires auth + employee role
+- Receives: { status: 'acknowledged' | 'resolved' }
+- Updates attended_by, timestamps
+- Also updates corresponding restaurant_alert
+
+RULES:
+- Follow the same patterns as the existing auth module (routes → controller → service)
+- Same error/success response format already established
+- Use supabaseAdmin (service_role client) for all database operations
+- Register new routes in the existing route setup
+- Do NOT touch any existing files except to add route imports
