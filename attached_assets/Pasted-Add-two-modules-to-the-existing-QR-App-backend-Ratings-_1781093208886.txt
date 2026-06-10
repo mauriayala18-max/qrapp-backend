@@ -1,0 +1,125 @@
+Add two modules to the existing QR App backend: Ratings/Reviews and Notifications. Do NOT modify or recreate existing files. Only add new module folders and register routes.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE 1: RATINGS & REVIEWS (/api/v1/ratings)
+Location: src/modules/ratings/
+
+--- DISH RATINGS & REVIEWS ---
+
+POST /api/v1/ratings/dish
+- Requires auth
+- Receives: { product_id, order_item_id, rating (1-5) }
+- Validates: order_item belongs to the user (via order.user_id or session_participants), order status is 'delivered' or 'ready'
+- Validates: user hasn't already rated this order_item (UNIQUE constraint)
+- Creates dish_ratings record
+- Awards points via the points service earn function (get amount from global_configuration 'rating_points')
+- Returns: rating record
+
+POST /api/v1/ratings/dish/:ratingId/review
+- Requires auth (owner of rating)
+- Receives: { review_text }
+- Creates dish_reviews record (status: 'visible')
+- Awards additional points via points service (get amount from global_configuration 'review_points')
+- Returns: review record
+
+GET /api/v1/products/:productId/ratings
+- Public
+- Returns: { average_rating, total_ratings, distribution: { 1: count, 2: count, 3: count, 4: count, 5: count } }
+
+GET /api/v1/products/:productId/reviews
+- Public
+- Returns paginated reviews with status = 'visible'
+- Each review includes: user full_name, user profile_photo_url, rating, review_text, created_at, restaurant_response (if exists)
+- Query params: ?page=1&limit=10&sort=recent|highest|lowest
+
+--- RESTAURANT RATINGS ---
+
+POST /api/v1/ratings/restaurant
+- Requires auth
+- Receives: { branch_id, session_id, rating (1-5) }
+- Validates: user participated in this session (via session_participants)
+- Validates: user hasn't already rated this session (UNIQUE constraint)
+- Creates restaurant_ratings record
+- Awards points if is_incentivized = true
+- Returns: rating record
+
+GET /api/v1/branches/:branchId/rating
+- Public
+- Returns: { average_rating, total_ratings }
+
+--- PANEL ENDPOINTS ---
+
+POST /api/v1/panel/reviews/:reviewId/respond
+- Requires auth + employee role (admin)
+- Receives: { response_text }
+- Creates review_responses record
+- Returns: response record
+
+PATCH /api/v1/panel/reviews/:reviewId/status
+- Requires auth + employee role (admin)
+- Receives: { status: 'visible' | 'hidden' | 'reported' }
+- Updates dish_reviews.status
+
+GET /api/v1/panel/branches/:branchId/reviews
+- Requires auth + employee role (admin)
+- Returns paginated reviews for all products in the branch
+- Query params: ?status=visible|hidden|reported&page=1&limit=20
+- Includes product name, user name, rating, review text, response if exists
+
+MODULE 2: NOTIFICATIONS (/api/v1/notifications)
+Location: src/modules/notifications/
+
+--- CLIENT ENDPOINTS ---
+
+GET /api/v1/notifications
+- Requires auth
+- Returns paginated notifications for the user, ordered by created_at DESC
+- Query params: ?page=1&limit=20&unread_only=true
+- Returns: notifications with is_read flag
+
+GET /api/v1/notifications/unread-count
+- Requires auth
+- Returns: { count: number }
+
+PATCH /api/v1/notifications/:notificationId/read
+- Requires auth
+- Marks notification as read (is_read = true, read_at = now)
+
+POST /api/v1/notifications/read-all
+- Requires auth
+- Marks all user's unread notifications as read
+
+GET /api/v1/notifications/preferences
+- Requires auth
+- Returns user's notification preferences from user_notification_preferences
+- If no preferences exist yet, return defaults (all enabled)
+
+PATCH /api/v1/notifications/preferences
+- Requires auth
+- Receives: { order_status?: boolean, payment?: boolean, reservation?: boolean, points?: boolean, promotion?: boolean, system?: boolean }
+- Upserts user_notification_preferences records
+
+--- NOTIFICATION SERVICE (internal, used by other modules) ---
+
+Export a createNotification function that other modules can call:
+- Receives: { user_id, notification_type, title, body, reference_type?, reference_id? }
+- Checks user's notification preferences — only creates if that type is enabled
+- Creates client_notifications record
+- Returns: notification record
+- NOTE: Actual push notification via Firebase will be integrated later. For now, just create the database record.
+
+Typical notifications to be created (by other modules calling this service):
+- Order status change → type: 'order_status', title: "Tu pedido está listo", body with details
+- Payment confirmed → type: 'payment', title: "Pago confirmado"
+- Reservation confirmed/rejected → type: 'reservation'
+- Points earned → type: 'points', title: "Ganaste X puntos"
+- New promotion at favorite restaurant → type: 'promotion'
+
+RULES:
+- Follow existing module patterns
+- Same error/success response format
+- Use supabaseAdmin for all DB operations
+- Import and use the points earn function from the points module where needed
+- Export createNotification for use by other modules
+- Register routes in existing route setup

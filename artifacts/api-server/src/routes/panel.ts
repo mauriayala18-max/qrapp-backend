@@ -21,6 +21,11 @@ import {
   createCoupon,
   getPromotionStats,
 } from "../modules/promotions/promotions.controller.js";
+import {
+  respondToReview,
+  updateReviewStatus,
+  getBranchReviews,
+} from "../modules/ratings/ratings.controller.js";
 
 const router: IRouter = Router();
 
@@ -40,5 +45,9 @@ router.patch("/promotions/:promotionId", authenticate, requireEmployee, updatePr
 router.delete("/promotions/:promotionId", authenticate, requireEmployee, deletePromotion);
 router.post("/branches/:branchId/coupons", authenticate, requireEmployee, createCoupon);
 router.get("/branches/:branchId/promotions/stats", authenticate, requireEmployee, getPromotionStats);
+
+router.post("/reviews/:reviewId/respond", authenticate, requireEmployee, respondToReview);
+router.patch("/reviews/:reviewId/status", authenticate, requireEmployee, updateReviewStatus);
+router.get("/branches/:branchId/reviews", authenticate, requireEmployee, getBranchReviews);
 
 export default router;

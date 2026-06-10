@@ -6,6 +6,7 @@ import { getBranchWaiterCalls } from "../modules/waiter-calls/waiter-calls.contr
 import { getBranchMenu, searchMenu, getFeaturedProducts } from "../modules/menu/menu.controller.js";
 import { getBankingBenefits } from "../modules/payments/payments.controller.js";
 import { getBranchPromotions } from "../modules/promotions/promotions.controller.js";
+import { getBranchRating } from "../modules/ratings/ratings.controller.js";
 
 const router: IRouter = Router();
 
@@ -16,5 +17,6 @@ router.get("/:branchId/menu/search", searchMenu);
 router.get("/:branchId/menu/featured", getFeaturedProducts);
 router.get("/:branchId/banking-benefits", optionalAuthenticate, getBankingBenefits);
 router.get("/:branchId/promotions", optionalAuthenticate, getBranchPromotions);
+router.get("/:branchId/rating", getBranchRating);
 
 export default router;

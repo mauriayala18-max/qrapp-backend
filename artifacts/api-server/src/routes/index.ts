@@ -15,6 +15,8 @@ import reservationsRouter from "../modules/reservations/reservations.routes.js";
 import pointsRouter from "../modules/points/points.routes.js";
 import promotionsRouter from "../modules/promotions/promotions.routes.js";
 import couponsRouter from "./coupons.js";
+import ratingsRouter from "../modules/ratings/ratings.routes.js";
+import notificationsRouter from "../modules/notifications/notifications.routes.js";
 
 const router: IRouter = Router();
 
@@ -39,5 +41,7 @@ router.use("/v1/reservations", reservationsRouter);
 router.use("/v1/points", pointsRouter);
 router.use("/v1/promotions", promotionsRouter);
 router.use("/v1/coupons", couponsRouter);
+router.use("/v1/ratings", ratingsRouter);
+router.use("/v1/notifications", notificationsRouter);
 
 export default router;
