@@ -6,6 +6,8 @@ import ordersRouter from "../modules/orders/orders.routes.js";
 import waiterCallsRouter from "../modules/waiter-calls/waiter-calls.routes.js";
 import branchesRouter from "./branches.js";
 import cancellationsRouter from "./cancellations.js";
+import productsRouter from "./products.js";
+import panelRouter from "./panel.js";
 
 const router: IRouter = Router();
 
@@ -21,5 +23,7 @@ router.use("/v1/orders", ordersRouter);
 router.use("/v1/waiter-calls", waiterCallsRouter);
 router.use("/v1/branches", branchesRouter);
 router.use("/v1/cancellations", cancellationsRouter);
+router.use("/v1/products", productsRouter);
+router.use("/v1/panel", panelRouter);
 
 export default router;

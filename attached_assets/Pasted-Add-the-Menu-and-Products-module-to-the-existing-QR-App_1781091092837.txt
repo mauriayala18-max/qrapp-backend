@@ -1,0 +1,106 @@
+Add the Menu and Products module to the existing QR App backend. Do NOT modify or recreate existing files. Only add new module folders and register routes.
+
+All database tables already exist in Supabase. Do NOT create or modify any tables.
+
+MODULE: MENU & PRODUCTS (/api/v1/menu)
+Location: src/modules/menu/
+
+--- CLIENT-FACING ENDPOINTS ---
+
+GET /api/v1/branches/:branchId/menu
+- Public (no auth required)
+- Returns the complete menu for a branch:
+  - Categories ordered by display_order, only is_active = true
+  - Products per category, only is_active = true AND is_available = true, ordered by display_order
+  - Each product includes: id, name, description, price, image_url, prep_time_minutes, is_featured, rating (avg from dish_ratings), review_count
+  - Modification groups per product with their options
+  - Current time slot highlighted based on current time vs menu_time_slots
+- Query params:
+  - ?time_slot_id=uuid → filter products by specific time slot
+  - ?language=en → return translated name/description from product_translations if available, fallback to original
+  - ?category_id=uuid → filter to single category
+
+GET /api/v1/branches/:branchId/menu/search
+- Public
+- Receives query param: ?q=string
+- Searches products by:
+  - Product name (ILIKE match)
+  - Product description (ILIKE match)
+  - Ingredient/keyword name (via product_ingredients + master_ingredients join)
+- Only returns active and available products
+- Returns: matching products with category name, price, image, rating
+
+GET /api/v1/branches/:branchId/menu/featured
+- Public
+- Returns products where is_featured = true, is_active = true, is_available = true
+- Ordered by display_order
+- Includes rating avg and review count
+
+GET /api/v1/products/:productId
+- Public
+- Returns full product detail:
+  - All product fields
+  - Category name
+  - Ingredients list
+  - Modification groups with options and prices
+  - Average rating and total reviews
+  - Time slots this product belongs to
+  - Translations available
+
+GET /api/v1/products/:productId/reviews
+- Public
+- Returns paginated reviews for the product
+- Only status = 'visible'
+- Includes: user full_name, rating, review_text, created_at, restaurant response if exists
+- Query params: ?page=1&limit=10&sort=recent|highest|lowest
+
+--- RESTAURANT PANEL ENDPOINTS (employee auth required) ---
+
+POST /api/v1/panel/branches/:branchId/products
+- Requires auth + employee role (admin only)
+- Receives: { category_id, name, description, price, image_url?, prep_time_minutes?, is_featured?, display_order?, is_ratable?, time_slot_ids?: string[], ingredients?: string[], modifications?: [{ name, is_required, min_selections, max_selections, options: [{ name, additional_price }] }] }
+- Creates product + product_time_slots + product_ingredients + modification_groups + modification_options
+- Logs change in menu_change_log (change_type: 'create')
+- Returns: created product with all relations
+
+PATCH /api/v1/panel/products/:productId
+- Requires auth + employee role (admin only)
+- Receives: partial product fields to update
+- Updates product
+- Logs in menu_change_log with old_value and new_value for each changed field
+- Returns: updated product
+
+PATCH /api/v1/panel/products/:productId/availability
+- Requires auth + employee role (admin or manager)
+- Receives: { is_available: boolean }
+- Quick toggle for marking product temporarily unavailable
+- Logs in menu_change_log (change_type: 'availability')
+
+DELETE /api/v1/panel/products/:productId
+- Requires auth + employee role (admin only)
+- Soft delete: sets is_active = false (never actually deletes)
+- Logs in menu_change_log (change_type: 'delete')
+
+POST /api/v1/panel/branches/:branchId/categories
+- Requires auth + employee role (admin only)
+- Receives: { name, description?, display_order? }
+- Creates menu_category
+- Returns: created category
+
+PATCH /api/v1/panel/categories/:categoryId
+- Requires auth + employee role (admin only)
+- Updates category fields
+- Logs change
+
+GET /api/v1/panel/branches/:branchId/menu/changelog
+- Requires auth + employee role (admin only)
+- Returns paginated menu_change_log for the branch
+- Query params: ?page=1&limit=20&entity_type=product|category
+
+RULES:
+- Follow existing module patterns (routes → controller → service)
+- Same error/success response format
+- Use supabaseAdmin for all DB operations
+- For average rating calculation, use a Supabase query that aggregates from dish_ratings
+- Search should be case-insensitive (ILIKE in PostgreSQL)
+- Register routes in existing route setup
