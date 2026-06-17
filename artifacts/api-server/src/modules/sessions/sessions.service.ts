@@ -24,40 +24,61 @@ export const joinSession = async (params: {
     throw createError("name is required for guest users", 400, "MISSING_FIELDS");
   }
 
-  let tableQuery = supabaseAdmin.from("tables").select("*, branches(*, restaurants(*))");
-  if (token) {
-    tableQuery = tableQuery.eq("current_session_token", token);
-  } else {
-    tableQuery = tableQuery.eq("current_pin", pin!);
-  }
+  let table = null;
+  let tableError = null;
+  let session = null;
 
-  const { data: table, error: tableError } = await tableQuery.maybeSingle();
+  if (token) {
+    const tableResult = await supabaseAdmin
+      .from("tables")
+      .select("*, branches(*, restaurants(*))")
+      .eq("current_session_token", token)
+      .maybeSingle();
+    table = tableResult.data;
+    tableError = tableResult.error;
+  } else {
+    // PIN is stored on the active session, not on the table
+    const sessionResult = await supabaseAdmin
+      .from("table_sessions")
+      .select("*, tables(*, branches(*, restaurants(*)))")
+      .eq("pin", pin!)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (sessionResult.data) {
+      session = sessionResult.data;
+      const tablesData = (sessionResult.data as Record<string, unknown>)["tables"];
+      table = tablesData as Record<string, unknown> | null;
+    }
+    tableError = sessionResult.error;
+  }
 
   if (tableError || !table) {
     throw createError("Invalid token or PIN", 404, "TABLE_NOT_FOUND");
   }
 
-  let session = null;
-  const { data: existingSession } = await supabaseAdmin
-    .from("table_sessions")
-    .select("*")
-    .eq("table_id", table.id)
-    .eq("status", "active")
-    .maybeSingle();
-
-  if (existingSession) {
-    session = existingSession;
-  } else {
-    const { data: newSession, error: sessionError } = await supabaseAdmin
+  if (!session) {
+    const { data: existingSession } = await supabaseAdmin
       .from("table_sessions")
-      .insert({ table_id: table.id, status: "active", started_at: new Date().toISOString() })
       .select("*")
-      .single();
+      .eq("table_id", table.id)
+      .eq("status", "active")
+      .maybeSingle();
 
-    if (sessionError || !newSession) {
-      throw createError(sessionError?.message ?? "Failed to create session", 500, "SESSION_CREATE_FAILED");
+    if (existingSession) {
+      session = existingSession;
+    } else {
+      const { data: newSession, error: sessionError } = await supabaseAdmin
+        .from("table_sessions")
+        .insert({ table_id: table.id, status: "active", started_at: new Date().toISOString() })
+        .select("*")
+        .single();
+
+      if (sessionError || !newSession) {
+        throw createError(sessionError?.message ?? "Failed to create session", 500, "SESSION_CREATE_FAILED");
+      }
+      session = newSession;
     }
-    session = newSession;
   }
 
   const participantData: Record<string, unknown> = {
@@ -95,7 +116,7 @@ export const joinSession = async (params: {
     session_id: session.id,
     table_number: table.table_number,
     branch: branch
-      ? { name: branch["name"], address: branch["address"] }
+      ? { id: branch["id"], name: branch["name"], address: branch["address"] }
       : null,
     restaurant_name: restaurant?.["name"] ?? null,
     participants: participants ?? [],
