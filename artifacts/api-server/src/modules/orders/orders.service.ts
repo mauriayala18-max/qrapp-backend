@@ -113,6 +113,7 @@ const buildOrder = async (params: {
         product_id: item.product_id,
         quantity: item.quantity,
         unit_price: unitPrice,
+        total_price: itemTotal,
         notes: item.notes,
         status: "received",
       })
