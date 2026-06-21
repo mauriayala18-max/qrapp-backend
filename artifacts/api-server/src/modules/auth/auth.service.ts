@@ -1,4 +1,4 @@
-import { supabaseAdmin } from "../../config/supabase.js";
+import { supabaseAdmin, supabaseAuth } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import type { UserProfile, EmployeeProfile } from "../../types/index.js";
 
@@ -73,7 +73,7 @@ export const registerUser = async (
   }
 
   const { data: passwordSignIn, error: passwordSignInError } =
-    await supabaseAdmin.auth.signInWithPassword({ email, password });
+    await supabaseAuth.auth.signInWithPassword({ email, password });
 
   if (passwordSignInError || !passwordSignIn.session) {
     throw createError("Failed to create session after registration", 500, "SESSION_FAILED");
@@ -96,7 +96,7 @@ export const loginUser = async (
   session: { access_token: string; refresh_token: string };
   needs_terms_acceptance: boolean;
 }> => {
-  const { data, error } = await supabaseAdmin.auth.signInWithPassword({ email, password });
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
 
   if (error || !data.session) {
     throw createError(error?.message ?? "Login failed", 401, "LOGIN_FAILED");
@@ -130,7 +130,7 @@ export const socialLogin = async (
   provider: "google" | "apple",
   access_token: string,
 ): Promise<{ user: UserProfile; session: { access_token: string; refresh_token: string } }> => {
-  const { data, error } = await supabaseAdmin.auth.signInWithIdToken({
+  const { data, error } = await supabaseAuth.auth.signInWithIdToken({
     provider,
     token: access_token,
   });
@@ -232,7 +232,7 @@ export const employeeLogin = async (
   employee: EmployeeProfile;
   session: { access_token: string; refresh_token: string };
 }> => {
-  const { data, error } = await supabaseAdmin.auth.signInWithPassword({ email, password });
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
 
   if (error || !data.session) {
     throw createError(error?.message ?? "Login failed", 401, "LOGIN_FAILED");
@@ -243,7 +243,7 @@ export const employeeLogin = async (
   const { data: employee, error: empError } = await supabaseAdmin
     .from("employees")
     .select("*")
-    .eq("user_id", userId)
+    .eq("auth_user_id", userId)
     .eq("is_active", true)
     .single();
 
