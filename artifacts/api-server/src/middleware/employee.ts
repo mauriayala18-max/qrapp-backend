@@ -1,5 +1,5 @@
 import { type Request, type Response, type NextFunction } from "express";
-import { supabaseAdmin } from "../config/supabase.js";
+import { supabaseAdmin, supabaseAuth } from "../config/supabase.js";
 import { createError } from "./errorHandler.js";
 
 export const requireEmployee = async (
@@ -14,7 +14,7 @@ export const requireEmployee = async (
   const { data, error } = await supabaseAdmin
     .from("employees")
     .select("id, role, is_active")
-    .eq("user_id", req.user.id)
+    .eq("auth_user_id", req.user.id)
     .eq("is_active", true)
     .maybeSingle();
 
@@ -37,7 +37,7 @@ export const optionalAuthenticate = async (
   }
 
   const token = authHeader.slice(7);
-  const { data } = await supabaseAdmin.auth.getUser(token);
+  const { data } = await supabaseAuth.auth.getUser(token);
 
   if (data?.user) {
     req.user = {
