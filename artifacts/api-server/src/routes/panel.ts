@@ -26,6 +26,12 @@ import {
   updateReviewStatus,
   getBranchReviews,
 } from "../modules/ratings/ratings.controller.js";
+import {
+  createTableGroup,
+  getTableGroups,
+  deleteTableGroup,
+} from "../modules/table-groups/table-groups.controller.js";
+import { requireRole } from "../middleware/roles.js";
 
 const router: IRouter = Router();
 
@@ -49,5 +55,26 @@ router.get("/branches/:branchId/promotions/stats", authenticate, requireEmployee
 router.post("/reviews/:reviewId/respond", authenticate, requireEmployee, respondToReview);
 router.patch("/reviews/:reviewId/status", authenticate, requireEmployee, updateReviewStatus);
 router.get("/branches/:branchId/reviews", authenticate, requireEmployee, getBranchReviews);
+
+router.post(
+  "/branches/:branchId/table-groups",
+  authenticate,
+  requireEmployee,
+  requireRole("admin", "manager"),
+  createTableGroup,
+);
+router.get(
+  "/branches/:branchId/table-groups",
+  authenticate,
+  requireEmployee,
+  getTableGroups,
+);
+router.delete(
+  "/table-groups/:groupId",
+  authenticate,
+  requireEmployee,
+  requireRole("admin", "manager"),
+  deleteTableGroup,
+);
 
 export default router;

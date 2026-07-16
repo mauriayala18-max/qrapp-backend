@@ -1,11 +1,41 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { closeGroupForSession } from "../table-groups/table-groups.service.js";
 
 const generateToken = () =>
   Math.random().toString(36).substring(2, 12).toUpperCase();
 
 const generatePin = () =>
   Math.floor(1000 + Math.random() * 9000).toString();
+
+/**
+ * If the table belongs to an active table group, return the group's shared
+ * active session so all grouped tables join the same session.
+ */
+const resolveGroupSession = async (
+  table: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> => {
+  const groupId = table["current_group_id"] as string | null | undefined;
+  if (!groupId) return null;
+
+  const { data: group } = await supabaseAdmin
+    .from("table_groups")
+    .select("session_id")
+    .eq("id", groupId)
+    .is("closed_at", null)
+    .maybeSingle();
+
+  if (!group) return null;
+
+  const { data: session } = await supabaseAdmin
+    .from("table_sessions")
+    .select("*")
+    .eq("id", group.session_id as string)
+    .eq("status", "active")
+    .maybeSingle();
+
+  return (session as Record<string, unknown> | null) ?? null;
+};
 
 export const joinSession = async (params: {
   token?: string;
@@ -55,6 +85,11 @@ export const joinSession = async (params: {
 
   if (tableError || !table) {
     throw createError("Invalid token or PIN", 404, "TABLE_NOT_FOUND");
+  }
+
+  if (!session) {
+    // Grouped tables share the group's session
+    session = await resolveGroupSession(table as Record<string, unknown>);
   }
 
   if (!session) {
@@ -145,31 +180,37 @@ export const scanAndJoin = async (params: {
     throw createError("name is required for guest users", 400, "MISSING_FIELDS");
   }
 
-  let session = null;
-  const { data: existingSession } = await supabaseAdmin
-    .from("table_sessions")
-    .select("*")
-    .eq("table_id", table.id)
-    .eq("status", "active")
-    .maybeSingle();
+  // Grouped tables share the group's session
+  let session = await resolveGroupSession(table as Record<string, unknown>);
 
-  if (existingSession) {
-    session = existingSession;
-  } else {
-    const { data: newSession, error: sessionError } = await supabaseAdmin
+  if (!session) {
+    const { data: existingSession } = await supabaseAdmin
       .from("table_sessions")
-      .insert({ table_id: table.id, status: "active", started_at: new Date().toISOString() })
       .select("*")
-      .single();
+      .eq("table_id", table.id)
+      .eq("status", "active")
+      .maybeSingle();
 
-    if (sessionError || !newSession) {
-      throw createError("Failed to create session", 500, "SESSION_CREATE_FAILED");
+    if (existingSession) {
+      session = existingSession;
+    } else {
+      const { data: newSession, error: sessionError } = await supabaseAdmin
+        .from("table_sessions")
+        .insert({ table_id: table.id, status: "active", started_at: new Date().toISOString() })
+        .select("*")
+        .single();
+
+      if (sessionError || !newSession) {
+        throw createError("Failed to create session", 500, "SESSION_CREATE_FAILED");
+      }
+      session = newSession;
     }
-    session = newSession;
   }
 
+  const activeSession = session as { id: string; status: string };
+
   const participantData: Record<string, unknown> = {
-    session_id: session.id,
+    session_id: activeSession.id,
     platform,
     connection_method: "qr",
     joined_at: new Date().toISOString(),
@@ -189,11 +230,11 @@ export const scanAndJoin = async (params: {
     { data: categories },
     { data: promotions },
   ] = await Promise.all([
-    supabaseAdmin.from("session_participants").select("*").eq("session_id", session.id),
+    supabaseAdmin.from("session_participants").select("*").eq("session_id", activeSession.id),
     supabaseAdmin
       .from("orders")
       .select("*, order_items(*, order_item_modifications(*))")
-      .eq("session_id", session.id)
+      .eq("session_id", activeSession.id)
       .neq("status", "cancelled"),
     branchId
       ? supabaseAdmin
@@ -222,8 +263,8 @@ export const scanAndJoin = async (params: {
 
   return {
     session: {
-      id: session.id,
-      status: session.status,
+      id: activeSession.id,
+      status: activeSession.status,
       table_number: table.table_number,
     },
     restaurant: {
@@ -316,4 +357,7 @@ export const closeSession = async (sessionId: string, employeeId: string): Promi
       current_pin: generatePin(),
     })
     .eq("id", tableId);
+
+  // If this session belongs to an active table group, close the group as well
+  await closeGroupForSession(sessionId);
 };
