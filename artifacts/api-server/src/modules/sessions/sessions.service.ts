@@ -1,12 +1,64 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { closeGroupForSession } from "../table-groups/table-groups.service.js";
+import { computeSessionBalance } from "../payments/balance.service.js";
+import { logger } from "../../lib/logger.js";
 
 const generateToken = () =>
   Math.random().toString(36).substring(2, 12).toUpperCase();
 
 const generatePin = () =>
   Math.floor(1000 + Math.random() * 9000).toString();
+
+/** `closed_by` / audit actors are employees.id, not the auth user id. */
+const resolveEmployeeId = async (authUserId: string): Promise<string> => {
+  const { data } = await supabaseAdmin
+    .from("employees")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  return ((data as Record<string, unknown> | null)?.["id"] as string | undefined) ?? authUserId;
+};
+
+/**
+ * Lazily open a session for a table that is currently free. A freed table has
+ * no active session, so the first diner to scan or enter the PIN opens one.
+ * The session adopts the table's current credentials so the printed QR keeps
+ * working after a close rotated them.
+ */
+const openSessionForTable = async (
+  table: Record<string, unknown>,
+): Promise<{ id: string; [key: string]: unknown }> => {
+  const tableId = table["id"] as string;
+  const token = (table["current_session_token"] as string | null) ?? generateToken();
+  const pin = (table["current_pin"] as string | null) ?? generatePin();
+
+  const { data, error } = await supabaseAdmin
+    .from("table_sessions")
+    .insert({
+      table_id: tableId,
+      branch_id: table["branch_id"] ?? null,
+      session_token: token,
+      pin,
+      status: "active",
+      opened_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (error || !data) {
+    throw createError(error?.message ?? "Failed to create session", 500, "SESSION_CREATE_FAILED");
+  }
+
+  await supabaseAdmin
+    .from("tables")
+    .update({ current_session_token: token, current_pin: pin })
+    .eq("id", tableId);
+
+  return data as { id: string; [key: string]: unknown };
+};
 
 /**
  * If the table belongs to an active table group, return the group's shared
@@ -103,16 +155,7 @@ export const joinSession = async (params: {
     if (existingSession) {
       session = existingSession;
     } else {
-      const { data: newSession, error: sessionError } = await supabaseAdmin
-        .from("table_sessions")
-        .insert({ table_id: table.id, status: "active", started_at: new Date().toISOString() })
-        .select("*")
-        .single();
-
-      if (sessionError || !newSession) {
-        throw createError(sessionError?.message ?? "Failed to create session", 500, "SESSION_CREATE_FAILED");
-      }
-      session = newSession;
+      session = await openSessionForTable(table as Record<string, unknown>);
     }
   }
 
@@ -194,16 +237,7 @@ export const scanAndJoin = async (params: {
     if (existingSession) {
       session = existingSession;
     } else {
-      const { data: newSession, error: sessionError } = await supabaseAdmin
-        .from("table_sessions")
-        .insert({ table_id: table.id, status: "active", started_at: new Date().toISOString() })
-        .select("*")
-        .single();
-
-      if (sessionError || !newSession) {
-        throw createError("Failed to create session", 500, "SESSION_CREATE_FAILED");
-      }
-      session = newSession;
+      session = await openSessionForTable(table as Record<string, unknown>);
     }
   }
 
@@ -309,10 +343,24 @@ export const getParticipants = async (sessionId: string): Promise<object[]> => {
   return data ?? [];
 };
 
-export const closeSession = async (sessionId: string, employeeId: string): Promise<void> => {
+/**
+ * Close a table session.
+ *
+ * A session can only close when `computeSessionBalance` says the bill is fully
+ * settled - the same helper GET /payments and invoice generation use, so the
+ * three can never disagree. Afterwards every freed table ends up with exactly
+ * one fresh credential set and NO active session, because availability is
+ * derived from the absence of an active session.
+ *
+ * @param actorAuthUserId the auth user id of the employee closing the table.
+ */
+export const closeSession = async (
+  sessionId: string,
+  actorAuthUserId: string,
+): Promise<void> => {
   const { data: session, error: sessionError } = await supabaseAdmin
     .from("table_sessions")
-    .select("*, orders(total_amount), payments(amount)")
+    .select("id, table_id, branch_id, opened_at")
     .eq("id", sessionId)
     .eq("status", "active")
     .single();
@@ -321,43 +369,121 @@ export const closeSession = async (sessionId: string, employeeId: string): Promi
     throw createError("Active session not found", 404, "SESSION_NOT_FOUND");
   }
 
-  const orders = (session as Record<string, unknown>)["orders"] as Array<{ total_amount: number }> ?? [];
-  const payments = (session as Record<string, unknown>)["payments"] as Array<{ amount: number }> ?? [];
+  const balance = await computeSessionBalance(sessionId);
 
-  const totalOrders = orders.reduce((sum, o) => sum + (o.total_amount ?? 0), 0);
-  const totalPayments = payments.reduce((sum, p) => sum + (p.amount ?? 0), 0);
-
-  if (Math.abs(totalOrders - totalPayments) > 0.01) {
+  if (!balance.is_settled) {
     throw createError(
-      "Cannot close session: pending payments remain",
+      "Cannot close session: the table still has a pending balance",
       400,
-      "PENDING_PAYMENTS",
+      "BALANCE_PENDING",
+      {
+        remaining: balance.remaining,
+        pending_participant_count: balance.pending_participant_count,
+      },
     );
   }
 
+  const employeeId = await resolveEmployeeId(actorAuthUserId);
   const tableId = (session as Record<string, unknown>)["table_id"] as string;
+  const closedAt = new Date().toISOString();
 
   const { error: closeError } = await supabaseAdmin
     .from("table_sessions")
-    .update({
-      status: "closed",
-      closed_at: new Date().toISOString(),
-      closed_by: employeeId,
-    })
+    .update({ status: "closed", closed_at: closedAt, closed_by: employeeId })
     .eq("id", sessionId);
 
   if (closeError) {
     throw createError(closeError.message, 500, "CLOSE_FAILED");
   }
 
-  await supabaseAdmin
-    .from("tables")
-    .update({
-      current_session_token: generateToken(),
-      current_pin: generatePin(),
-    })
-    .eq("id", tableId);
+  // If this session belongs to an active table group, close the group and free
+  // its tables WITHOUT opening replacement sessions - a freed table must have
+  // none. Diners opening a new one is handled lazily on the next scan/PIN.
+  const groupTableIds = await closeGroupForSession(sessionId, false);
 
-  // If this session belongs to an active table group, close the group as well
-  await closeGroupForSession(sessionId);
+  const freedTableIds = [...new Set([tableId, ...groupTableIds])].filter(Boolean);
+
+  // No orphan active session may be left pointing at a freed table.
+  if (freedTableIds.length > 0) {
+    const { error: orphanError } = await supabaseAdmin
+      .from("table_sessions")
+      .update({ status: "closed", closed_at: closedAt, closed_by: employeeId })
+      .in("table_id", freedTableIds)
+      .eq("status", "active");
+
+    if (orphanError) {
+      throw createError(orphanError.message, 500, "CLOSE_INCOMPLETE", { session_id: sessionId });
+    }
+  }
+
+  // Exactly one fresh credential set per freed table.
+  for (const freedTableId of freedTableIds) {
+    const { error: rotateError } = await supabaseAdmin
+      .from("tables")
+      .update({ current_session_token: generateToken(), current_pin: generatePin() })
+      .eq("id", freedTableId);
+
+    if (rotateError) {
+      throw createError(rotateError.message, 500, "CLOSE_INCOMPLETE", {
+        session_id: sessionId,
+        table_id: freedTableId,
+      });
+    }
+  }
+
+  // PostgREST gives no transaction, so the invariant is verified rather than
+  // assumed: never report a clean close over a half-applied one.
+  if (freedTableIds.length > 0) {
+    const { data: lingering, error: verifyError } = await supabaseAdmin
+      .from("table_sessions")
+      .select("id")
+      .in("table_id", freedTableIds)
+      .eq("status", "active");
+
+    if (verifyError) {
+      throw createError(verifyError.message, 500, "CLOSE_INCOMPLETE", { session_id: sessionId });
+    }
+
+    if ((lingering ?? []).length > 0) {
+      throw createError(
+        "Session closed but freed tables still have an active session",
+        500,
+        "CLOSE_INCOMPLETE",
+        {
+          session_id: sessionId,
+          lingering_session_ids: (lingering ?? []).map(
+            (s: Record<string, unknown>) => s["id"] as string,
+          ),
+        },
+      );
+    }
+  }
+
+  const { error: auditError } = await supabaseAdmin.from("audit_log").insert({
+    actor_type: "employee",
+    actor_id: employeeId,
+    action: "close_session",
+    module: "sessions",
+    reference_type: "session",
+    reference_id: sessionId,
+    log_level: "full",
+    old_value: {
+      status: "active",
+      opened_at: (session as Record<string, unknown>)["opened_at"] ?? null,
+    },
+    new_value: {
+      status: "closed",
+      closed_at: closedAt,
+      closed_by: employeeId,
+      freed_table_ids: freedTableIds,
+      total_ordered: balance.total_ordered,
+      total_paid: balance.total_paid,
+      total_discount_absorbed: balance.total_discount_absorbed,
+    },
+    created_at: closedAt,
+  });
+
+  if (auditError) {
+    logger.error({ err: auditError, sessionId }, "close_session audit_log insert failed");
+  }
 };

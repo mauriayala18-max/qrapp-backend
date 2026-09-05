@@ -1,0 +1,74 @@
+Continue from the previous audit of the QR App backend (Node.js + Express + TypeScript + Supabase).
+Now IMPLEMENT. Report as you go.
+
+NON-NEGOTIABLE:
+- supabaseAuth ONLY for auth ops; supabaseAdmin (service_role) ONLY for .from() data queries.
+- Responses: success { data, message? } / error { error: true, message, code }.
+- Endpoints under /api/v1/. requireEmployee / requireRole exist.
+- Guaraníes = INTEGER. Soft deletes only. Realtime already on payments/table_sessions/restaurant_alerts.
+- audit_log has levels full/simple.
+
+STEP 0 — MONEY SEMANTICS (report, then build to match):
+Read the POST /api/v1/payments handler. State precisely and explicitly:
+  (i) what amount is actually charged to the payer,
+  (ii) what portion counts toward settling the order total,
+  (iii) how payments.amount vs payments.discount_amount behave for banking_benefits.benefit_type
+       = 'discount' (restaurant-absorbed) vs 'reimbursement' (bank-absorbed, customer pays full),
+  (iv) whether payments.tip_amount is included in payments.amount or separate.
+Write these as stated assumptions BEFORE coding, and build STEP 1 to match them.
+
+STEP 1 — SINGLE SOURCE OF TRUTH FOR BALANCE:
+Create one shared helper computeSessionBalance(sessionId) returning:
+  { total_ordered, total_paid, total_discount_absorbed, remaining, is_settled, pending_participant_count }
+Rules:
+  - total_ordered = sum over NON-cancelled orders (exclude status='cancelled').
+  - total_paid = sum of payments.amount where status='completed' ONLY.
+  - Restaurant-absorbed discounts must NOT leave a phantom remaining: for 'discount' benefit type the
+    discount_amount counts toward settlement; for 'reimbursement' the customer pays full so no adjustment.
+  - Tips (tip_amount) are EXCLUDED from order settlement entirely.
+  - remaining = max(0, total_ordered - settled). is_settled = (remaining === 0).
+  - pending_participant_count = participants/payment-links still owing (equal / choose_mine / custom).
+Refactor GET /api/v1/sessions/:sessionId/payments to return values from THIS helper, so API and
+close/invoice never diverge. All INTEGER Gs.
+
+STEP 2 — HARDEN CLOSE (POST /api/v1/sessions/:sessionId/close):
+  - Keep requireEmployee.
+  - Block unless is_settled; on block return { error:true, code:'BALANCE_PENDING', remaining,
+    pending_participant_count }.
+  - Keep existing group handling and token+PIN rotation. Verify that AFTER close there is exactly one
+    fresh credential set per table and NO leftover/orphan active session pointing at any freed table
+    (availability is derived from absence of an active session, not a separate column). Confirm the join
+    model and prevent duplicate active sessions.
+  - Write audit_log (full): actor = employee, old/new session status.
+
+STEP 3 — INVOICE:
+  - POST /api/v1/sessions/:sessionId/invoice: ADD requireEmployee (currently missing). Use the shared
+    helper for the balance check.
+  - Auto-close: if invoice_type='single' AND is_settled → close the session via the same close logic
+    (fiscal print = table close). If invoice_type='individual'/split → do NOT auto-close (waiter closes
+    explicitly later). 
+  - GET /api/v1/sessions/:sessionId/invoice and GET /payments: DO NOT add requireEmployee (the client app
+    reads these). Just validate the session exists.
+
+STEP 4 — DIGITAL PAYMENT ALERT:
+  In POST /api/v1/payments, when a payment completes with payment_method in (card, apple_pay, google_pay)
+  and NOT (cash, pos): insert restaurant_alert { branch_id, alert_type:'payment_received',
+  reference_type:'session', reference_id: sessionId, recipient_role:'waiter',
+  recipient_employee_id: assigned waiter if any, status:'pending' }.
+  The current restaurant_alerts constraint definition is:
+  <<<PASTE THE SQL QUERY OUTPUT HERE>>>
+  If it is a Postgres ENUM → produce ALTER TYPE ... ADD VALUE IF NOT EXISTS 'payment_received'.
+  If it is a CHECK constraint → produce a migration that DROPs and recreates the CHECK with ALL existing
+  values PLUS 'payment_received'. Give me the exact SQL to run in Supabase SQL Editor; do not assume it ran.
+
+STEP 5 — BUG FIX (alerts):
+  The call-waiter code writes column `type='client_calling'`; the real column is `alert_type`. Fix it to
+  write alert_type. Ensure 'client_calling' is an accepted value under the same constraint; if not, include
+  it in the STEP 4 migration.
+
+DELIVERABLES:
+  - The STEP 0 semantics conclusion.
+  - Summary of changed files.
+  - The exact SQL migration to run in Supabase.
+  - Confirmation that GET /payments, close, and invoice all use computeSessionBalance().
+Do NOT modify tip or banking-benefit calculation beyond reading them. Do NOT touch app or panel.

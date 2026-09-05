@@ -261,7 +261,22 @@ export const getTableGroups = async (branchId: string): Promise<object[]> => {
   }));
 };
 
-const releaseGroupTables = async (groupId: string): Promise<void> => {
+/**
+ * Detach every table from the group.
+ *
+ * `createFreshSessions` distinguishes the two callers:
+ *  - unmerge (deleteTableGroup): each freed table immediately gets its own
+ *    active session again, because the diners are still seated.
+ *  - session close: the table must end up with NO active session - availability
+ *    is derived from the absence of one - so the caller rotates credentials and
+ *    leaves the table free instead.
+ *
+ * Returns the ids of the tables that were released.
+ */
+const releaseGroupTables = async (
+  groupId: string,
+  createFreshSessions = true,
+): Promise<string[]> => {
   const { data: tablesData, error: tablesError } = await supabaseAdmin
     .from("tables")
     .select("id, branch_id, table_number, current_group_id")
@@ -282,9 +297,13 @@ const releaseGroupTables = async (groupId: string): Promise<void> => {
     throw createError(clearError.message, 500, "UPDATE_FAILED");
   }
 
-  for (const table of tables) {
-    await createSessionForTable(table);
+  if (createFreshSessions) {
+    for (const table of tables) {
+      await createSessionForTable(table);
+    }
   }
+
+  return tables.map((t) => t.id);
 };
 
 export const deleteTableGroup = async (groupId: string): Promise<void> => {
@@ -317,9 +336,15 @@ export const deleteTableGroup = async (groupId: string): Promise<void> => {
 
 /**
  * Called when a session is closed. If the session belongs to an active table
- * group, close the group and release its tables with fresh sessions.
+ * group, close the group and release its tables.
+ *
+ * Returns the ids of the released tables so the caller can rotate credentials
+ * and guarantee no orphan active session is left behind.
  */
-export const closeGroupForSession = async (sessionId: string): Promise<void> => {
+export const closeGroupForSession = async (
+  sessionId: string,
+  createFreshSessions = true,
+): Promise<string[]> => {
   const { data: group } = await supabaseAdmin
     .from("table_groups")
     .select("id")
@@ -327,7 +352,7 @@ export const closeGroupForSession = async (sessionId: string): Promise<void> => 
     .is("closed_at", null)
     .maybeSingle();
 
-  if (!group) return;
+  if (!group) return [];
 
   const groupId = group.id as string;
 
@@ -336,5 +361,5 @@ export const closeGroupForSession = async (sessionId: string): Promise<void> => 
     .update({ closed_at: new Date().toISOString() })
     .eq("id", groupId);
 
-  await releaseGroupTables(groupId);
+  return releaseGroupTables(groupId, createFreshSessions);
 };

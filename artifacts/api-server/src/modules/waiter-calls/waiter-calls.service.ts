@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { logger } from "../../lib/logger.js";
 
 export const callWaiter = async (params: {
   sessionId: string;
@@ -8,11 +9,11 @@ export const callWaiter = async (params: {
   userId?: string;
   participantName?: string;
 }): Promise<object> => {
-  const { sessionId, reason_id, custom_reason, userId, participantName } = params;
+  const { sessionId, reason_id, custom_reason, userId } = params;
 
   const { data: session, error: sessionError } = await supabaseAdmin
     .from("table_sessions")
-    .select("id, table_id, tables(branch_id)")
+    .select("id, table_id, branch_id, tables(branch_id)")
     .eq("id", sessionId)
     .eq("status", "active")
     .single();
@@ -21,17 +22,26 @@ export const callWaiter = async (params: {
     throw createError("Active session not found", 404, "SESSION_NOT_FOUND");
   }
 
-  const table = (session as Record<string, unknown>)["tables"] as Record<string, unknown> | null;
-  const branchId = table?.["branch_id"] as string | undefined;
+  const sessionRow = session as Record<string, unknown>;
+  const table = sessionRow["tables"] as Record<string, unknown> | null;
+  const tableId = sessionRow["table_id"] as string | null;
+  const branchId =
+    (sessionRow["branch_id"] as string | null) ?? (table?.["branch_id"] as string | null) ?? null;
+
+  // `called_by` is NOT NULL: a guest with no account cannot raise a call.
+  if (!userId) {
+    throw createError("A signed-in user is required to call the waiter", 401, "UNAUTHORIZED");
+  }
 
   const { data: call, error: callError } = await supabaseAdmin
     .from("waiter_calls")
     .insert({
       session_id: sessionId,
+      table_id: tableId,
+      branch_id: branchId,
+      called_by: userId,
       reason_id: reason_id ?? null,
       custom_reason: custom_reason ?? null,
-      requested_by_user: userId ?? null,
-      requested_by_name: participantName ?? null,
       status: "pending",
       created_at: new Date().toISOString(),
     })
@@ -42,15 +52,26 @@ export const callWaiter = async (params: {
     throw createError(callError?.message ?? "Failed to create waiter call", 500, "CALL_CREATE_FAILED");
   }
 
-  await supabaseAdmin.from("restaurant_alerts").insert({
-    type: "client_calling",
+  const callId = (call as Record<string, unknown>)["id"] as string;
+
+  // The column is `alert_type` (not `type`) and the allowed statuses are
+  // pending / acknowledged / resolved (not unread / read).
+  const { error: alertError } = await supabaseAdmin.from("restaurant_alerts").insert({
+    branch_id: branchId,
+    alert_type: "client_calling",
+    reference_type: "waiter_call",
+    reference_id: callId,
     recipient_role: "waiter",
-    branch_id: branchId ?? null,
-    session_id: sessionId,
-    reference_id: (call as Record<string, unknown>)["id"],
-    status: "unread",
+    status: "pending",
     created_at: new Date().toISOString(),
   });
+
+  if (alertError) {
+    logger.error(
+      { err: alertError, sessionId, callId },
+      "client_calling alert insert failed (the waiter call itself was created)",
+    );
+  }
 
   return {
     call_id: (call as Record<string, unknown>)["id"],
@@ -86,7 +107,8 @@ export const getBranchWaiterCalls = async (branchId: string): Promise<object[]> 
     return {
       id: call["id"],
       table_number: table?.["table_number"] ?? null,
-      participant_name: call["requested_by_name"] ?? null,
+      // `waiter_calls` stores only `called_by` (a user id), no display name.
+      participant_name: null,
       reason_id: call["reason_id"] ?? null,
       custom_reason: call["custom_reason"] ?? null,
       status: call["status"],
@@ -123,11 +145,17 @@ export const updateWaiterCall = async (params: {
     throw createError(error?.message ?? "Waiter call not found", 404, "CALL_NOT_FOUND");
   }
 
+  const now = new Date().toISOString();
   await supabaseAdmin
     .from("restaurant_alerts")
-    .update({ status: status === "resolved" ? "read" : "acknowledged" })
+    .update(
+      status === "resolved"
+        ? { status: "resolved", resolved_by: employeeId, resolved_at: now }
+        : { status: "acknowledged", acknowledged_by: employeeId, acknowledged_at: now },
+    )
     .eq("reference_id", callId)
-    .eq("type", "client_calling");
+    .eq("reference_type", "waiter_call")
+    .eq("alert_type", "client_calling");
 
   return call;
 };

@@ -16,7 +16,7 @@ router.post("/:sessionId/call-waiter", optionalAuthenticate, waiterCallsControll
 router.get("/:sessionId/payments", paymentsController.getSessionPayments);
 router.post("/:sessionId/split", authenticate, paymentsController.createSplit);
 router.post("/:sessionId/payment-link", authenticate, paymentsController.createPaymentLink);
-router.post("/:sessionId/invoice", authenticate, paymentsController.createInvoice);
+router.post("/:sessionId/invoice", authenticate, requireEmployee, paymentsController.createInvoice);
 router.get("/:sessionId/invoice", paymentsController.getSessionInvoices);
 
 export default router;

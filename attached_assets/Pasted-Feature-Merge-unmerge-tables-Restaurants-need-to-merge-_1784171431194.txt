@@ -1,0 +1,46 @@
+Feature: Merge/unmerge tables
+Restaurants need to merge tables into a group that shares one session. The schema is ready: table_groups table exists, and tables has a current_group_id column.
+Create these endpoints:
+1. POST /api/v1/panel/branches/:branchId/table-groups
+
+Body: { table_ids: ["uuid1", "uuid2", ...], name?: "Mesas 2-3" }
+Auth: employee (admin or manager role)
+Logic:
+
+Validate all tables belong to the branch
+Pick the first table's active session as the shared session (or create a new one if none exists)
+Create a table_groups record with the session_id
+Update all tables: set current_group_id to the new group
+For tables that had their own active sessions, move their participants and orders to the shared session
+Auto-generate name if not provided: "Mesas {numbers}" (e.g., "Mesas 2-3")
+
+
+Returns: the group with its tables and session
+
+2. GET /api/v1/panel/branches/:branchId/table-groups
+
+Auth: employee
+Returns: all active (closed_at IS NULL) table groups with their tables
+
+3. DELETE /api/v1/panel/table-groups/:groupId
+
+Auth: employee (admin or manager)
+Logic:
+
+Set closed_at on the group
+Clear current_group_id on all tables in the group
+Create new individual sessions for each table (with new tokens and PINs)
+The shared session stays open until payment is complete
+
+
+Returns: success
+
+4. When closing a session (POST /sessions/:sessionId/close):
+
+If the session belongs to a table group, also close the group (set closed_at, clear current_group_id on all tables, create new sessions for each)
+
+Use supabaseAdmin for all data queries (same pattern as orders). Push to GitHub after fixing.
+Test with:
+TOKEN=$(curl -s -X POST https://restaurant-backend.replit.app/api/v1/auth/employee/login -H "Content-Type: application/json" -d '{"email":"admin@ragusa.com.py","password":"Test1234!"}' | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+# Merge tables 1 and 2:
+curl -s -X POST https://restaurant-backend.replit.app/api/v1/panel/branches/22222222-2222-2222-2222-222222222222/table-groups -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" -d '{"table_ids":["TABLE1_UUID","TABLE2_UUID"]}'

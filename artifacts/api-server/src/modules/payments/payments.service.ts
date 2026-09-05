@@ -1,5 +1,78 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { logger } from "../../lib/logger.js";
+import { computeSessionBalance } from "./balance.service.js";
+import { closeSession } from "../sessions/sessions.service.js";
+
+/** `branches` has no short_name column - derive a stable prefix from the name. */
+const branchShortCode = (branchName?: string | null): string => {
+  const cleaned = (branchName ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return cleaned.length > 0 ? cleaned.slice(0, 4) : "QR";
+};
+
+const assertSessionExists = async (sessionId: string): Promise<void> => {
+  const { data } = await supabaseAdmin
+    .from("table_sessions")
+    .select("id")
+    .eq("id", sessionId)
+    .maybeSingle();
+
+  if (!data) {
+    throw createError("Session not found", 404, "SESSION_NOT_FOUND");
+  }
+};
+
+/**
+ * A completed DIGITAL payment (card / apple_pay / google_pay) raises a
+ * `payment_received` alert for the waiter. Cash and POS are handed to an
+ * employee in person, so they raise nothing.
+ *
+ * Requires `payment_received` to be allowed by the
+ * `restaurant_alerts_alert_type_check` CHECK constraint (see the migration
+ * shipped with this change). A failing alert must never roll back a payment
+ * that already succeeded, so the error is logged, not thrown.
+ */
+const notifyWaiterOfDigitalPayment = async (params: {
+  sessionId: string;
+  branchId: string | null;
+  tableId: string | null;
+  paymentId: string;
+}): Promise<void> => {
+  const { sessionId, branchId, tableId, paymentId } = params;
+
+  let assignedWaiterId: string | null = null;
+  if (tableId) {
+    const { data: assignment } = await supabaseAdmin
+      .from("table_waiter_assignments")
+      .select("employee_id")
+      .eq("table_id", tableId)
+      .eq("is_active", true)
+      .limit(1)
+      .maybeSingle();
+
+    assignedWaiterId =
+      ((assignment as Record<string, unknown> | null)?.["employee_id"] as string | undefined) ??
+      null;
+  }
+
+  const { error } = await supabaseAdmin.from("restaurant_alerts").insert({
+    branch_id: branchId,
+    alert_type: "payment_received",
+    reference_type: "session",
+    reference_id: sessionId,
+    recipient_role: "waiter",
+    recipient_employee_id: assignedWaiterId,
+    status: "pending",
+    created_at: new Date().toISOString(),
+  });
+
+  if (error) {
+    logger.error(
+      { err: error, sessionId, paymentId },
+      "payment_received alert insert failed (the payment itself succeeded)",
+    );
+  }
+};
 
 const generateReceiptNumber = (branchShort: string): string => {
   const ts = Date.now();
@@ -51,7 +124,9 @@ export const createPayment = async (params: {
 
   const { data: session, error: sessionError } = await supabaseAdmin
     .from("table_sessions")
-    .select("id, table_id, tables(branch_id, branches(short_name, branch_payment_methods(*)))")
+    .select(
+      "id, table_id, branch_id, tables(branch_id, branches(name, branch_payment_methods(payment_method, is_enabled)))",
+    )
     .eq("id", session_id)
     .eq("status", "active")
     .single();
@@ -60,14 +135,17 @@ export const createPayment = async (params: {
     throw createError("Active session not found", 404, "SESSION_NOT_FOUND");
   }
 
-  const table = (session as Record<string, unknown>)["tables"] as Record<string, unknown> | null;
+  const sessionRow = session as Record<string, unknown>;
+  const tableId = sessionRow["table_id"] as string | null;
+  const table = sessionRow["tables"] as Record<string, unknown> | null;
   const branch = table?.["branches"] as Record<string, unknown> | null;
-  const branchId = branch?.["id"] as string | undefined;
-  const branchShort = (branch?.["short_name"] as string | undefined) ?? "QR";
+  const branchId =
+    (sessionRow["branch_id"] as string | null) ?? (table?.["branch_id"] as string | null) ?? null;
+  const branchShort = branchShortCode(branch?.["name"] as string | undefined);
   const paymentMethods = (branch?.["branch_payment_methods"] as Array<Record<string, unknown>>) ?? [];
 
   const methodAllowed = paymentMethods.some(
-    (pm) => pm["method"] === payment_method && pm["is_active"] === true,
+    (pm) => pm["payment_method"] === payment_method && pm["is_enabled"] === true,
   );
   if (!methodAllowed) {
     throw createError(`Payment method '${payment_method}' is not accepted by this branch`, 400, "METHOD_NOT_ACCEPTED");
@@ -109,31 +187,28 @@ export const createPayment = async (params: {
 
   const finalAmount = amount - discountAmount;
   const isDigital = ["card", "apple_pay", "google_pay"].includes(payment_method);
-  const status = "completed";
+  const completedAt = new Date().toISOString();
 
+  // These are the columns that actually exist on `payments`. branch_id,
+  // original_amount, billing_profile_id, benefit_name and paid_by are NOT
+  // columns on the table - they are returned to the caller, not persisted.
   const paymentInsert: Record<string, unknown> = {
     session_id,
-    branch_id: branchId ?? null,
     amount: finalAmount,
-    original_amount: amount,
     discount_amount: discountAmount,
     payment_method,
     tip_amount: tip_amount ?? 0,
     tip_type: tip_type ?? null,
-    billing_profile_id: billing_profile_id ?? null,
     card_id: card_id ?? null,
     banking_benefit_id: banking_benefit_id ?? null,
-    benefit_name: benefitName,
-    status,
-    paid_by: userId ?? null,
-    created_at: new Date().toISOString(),
+    status: "completed",
+    user_id: userId ?? null,
+    completed_at: completedAt,
+    created_at: completedAt,
   };
 
   if (isDigital) {
     paymentInsert["bancard_process_id"] = `PLACEHOLDER-${Date.now()}`;
-    paymentInsert["completed_at"] = new Date().toISOString();
-  } else {
-    paymentInsert["completed_at"] = new Date().toISOString();
   }
 
   const { data: payment, error: paymentError } = await supabaseAdmin
@@ -148,20 +223,33 @@ export const createPayment = async (params: {
 
   const receiptNumber = generateReceiptNumber(branchShort);
 
+  const paymentId = (payment as Record<string, unknown>)["id"] as string;
+
   const { data: receipt } = await supabaseAdmin
     .from("payment_receipts")
     .insert({
-      payment_id: (payment as Record<string, unknown>)["id"],
+      payment_id: paymentId,
       receipt_number: receiptNumber,
-      issued_at: new Date().toISOString(),
     })
     .select("*")
     .single();
 
-  return { ...(payment as object), receipt };
+  if (isDigital) {
+    await notifyWaiterOfDigitalPayment({ sessionId: session_id, branchId, tableId, paymentId });
+  }
+
+  return {
+    ...(payment as object),
+    original_amount: amount,
+    benefit_name: benefitName,
+    billing_profile_id: billing_profile_id ?? null,
+    receipt,
+  };
 };
 
 export const getSessionPayments = async (sessionId: string): Promise<object> => {
+  await assertSessionExists(sessionId);
+
   const { data: payments, error } = await supabaseAdmin
     .from("payments")
     .select("*, users(full_name), payment_receipts(*)")
@@ -171,28 +259,13 @@ export const getSessionPayments = async (sessionId: string): Promise<object> => 
     throw createError(error.message, 500, "FETCH_FAILED");
   }
 
-  const { data: orders } = await supabaseAdmin
-    .from("orders")
-    .select("total_amount")
-    .eq("session_id", sessionId)
-    .neq("status", "cancelled");
-
-  const total_ordered = (orders ?? []).reduce(
-    (sum: number, o: Record<string, unknown>) => sum + ((o["total_amount"] as number) ?? 0),
-    0,
-  );
-
-  const total_paid = (payments ?? []).reduce(
-    (sum: number, p: Record<string, unknown>) =>
-      p["status"] === "completed" ? sum + ((p["amount"] as number) ?? 0) : sum,
-    0,
-  );
+  const balance = await computeSessionBalance(sessionId);
 
   return {
     payments: payments ?? [],
-    total_ordered,
-    total_paid,
-    remaining_balance: Math.max(0, total_ordered - total_paid),
+    ...balance,
+    // Legacy alias kept so existing clients keep working.
+    remaining_balance: balance.remaining,
   };
 };
 
@@ -216,13 +289,21 @@ export const createSplit = async (params: {
   participants_count: number;
   userId: string;
 }): Promise<object> => {
-  const { sessionId, split_method, participants_count, userId } = params;
+  const { sessionId, split_method, participants_count } = params;
 
-  const { data: orders } = await supabaseAdmin
+  if (!Number.isInteger(participants_count) || participants_count < 1) {
+    throw createError("participants_count must be a positive integer", 400, "INVALID_PARTICIPANTS");
+  }
+
+  const { data: orders, error: ordersError } = await supabaseAdmin
     .from("orders")
     .select("total_amount")
     .eq("session_id", sessionId)
     .neq("status", "cancelled");
+
+  if (ordersError) {
+    throw createError(ordersError.message, 500, "FETCH_FAILED");
+  }
 
   const total = (orders ?? []).reduce(
     (sum: number, o: Record<string, unknown>) => sum + ((o["total_amount"] as number) ?? 0),
@@ -237,15 +318,14 @@ export const createSplit = async (params: {
     remainder = total - amount_per_person * participants_count;
   }
 
+  // `account_splits` only stores session_id / split_method / total_participants.
+  // The per-person figures are derived and returned, never persisted.
   const { data, error } = await supabaseAdmin
     .from("account_splits")
     .insert({
       session_id: sessionId,
       split_method,
-      participants_count,
-      total_amount: total,
-      amount_per_person,
-      created_by: userId,
+      total_participants: participants_count,
       created_at: new Date().toISOString(),
     })
     .select("*")
@@ -257,6 +337,7 @@ export const createSplit = async (params: {
 
   return {
     ...(data as object),
+    total_amount: total,
     amount_per_person,
     remainder,
     first_person_amount: amount_per_person != null ? amount_per_person + (remainder ?? 0) : null,
@@ -269,6 +350,31 @@ export const claimSplitItems = async (params: {
   userId: string;
 }): Promise<object[]> => {
   const { splitId, items, userId } = params;
+
+  // `claimed_items.participant_id` points at session_participants, not at the
+  // auth user, so the caller has to be resolved to their participant row.
+  const { data: split } = await supabaseAdmin
+    .from("account_splits")
+    .select("id, session_id")
+    .eq("id", splitId)
+    .maybeSingle();
+
+  if (!split) {
+    throw createError("Split not found", 404, "SPLIT_NOT_FOUND");
+  }
+
+  const { data: participant } = await supabaseAdmin
+    .from("session_participants")
+    .select("id")
+    .eq("session_id", (split as Record<string, unknown>)["session_id"] as string)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (!participant) {
+    throw createError("You are not a participant of this session", 403, "NOT_A_PARTICIPANT");
+  }
+
+  const participantId = (participant as Record<string, unknown>)["id"] as string;
 
   const claimedList: object[] = [];
 
@@ -295,7 +401,7 @@ export const claimSplitItems = async (params: {
       } else {
         const { data: created } = await supabaseAdmin
           .from("claimed_items")
-          .insert({ split_id: splitId, order_item_id, claimed_by: userId, is_shared: true, share_count: 1 })
+          .insert({ split_id: splitId, order_item_id, participant_id: participantId, is_shared: true, share_count: 1 })
           .select("*")
           .single();
         if (created) claimedList.push(created);
@@ -315,7 +421,7 @@ export const claimSplitItems = async (params: {
 
       const { data: created } = await supabaseAdmin
         .from("claimed_items")
-        .insert({ split_id: splitId, order_item_id, claimed_by: userId, is_shared: false, share_count: 1 })
+        .insert({ split_id: splitId, order_item_id, participant_id: participantId, is_shared: false, share_count: 1 })
         .select("*")
         .single();
       if (created) claimedList.push(created);
@@ -442,7 +548,7 @@ export const completePaymentLink = async (params: {
 
   const { data: link, error: linkError } = await supabaseAdmin
     .from("payment_links")
-    .select("*, table_sessions(tables(branch_id, branches(short_name, branch_payment_methods(*))))")
+    .select("*, table_sessions(id, table_id, branch_id, tables(branch_id, branches(name)))")
     .eq("id", linkId)
     .eq("status", "active")
     .single();
@@ -456,26 +562,33 @@ export const completePaymentLink = async (params: {
     throw createError("Payment link has expired", 410, "LINK_EXPIRED");
   }
 
-  const table = (l["table_sessions"] as Record<string, unknown> | null)?.["tables"] as Record<string, unknown> | null;
+  const linkSession = l["table_sessions"] as Record<string, unknown> | null;
+  const table = linkSession?.["tables"] as Record<string, unknown> | null;
   const branch = table?.["branches"] as Record<string, unknown> | null;
-  const branchShort = (branch?.["short_name"] as string | undefined) ?? "QR";
+  const branchShort = branchShortCode(branch?.["name"] as string | undefined);
+  const branchId =
+    (linkSession?.["branch_id"] as string | null) ?? (table?.["branch_id"] as string | null) ?? null;
+  const tableId = (linkSession?.["table_id"] as string | null) ?? null;
+  const sessionId = l["session_id"] as string;
+  const isDigital = ["card", "apple_pay", "google_pay"].includes(payment_method);
+  const completedAt = new Date().toISOString();
 
+  // Only the columns that exist on `payments`. There is no payment_link_id
+  // column - the link records who used it via used_by / used_at instead.
   const { data: payment, error: paymentError } = await supabaseAdmin
     .from("payments")
     .insert({
-      session_id: l["session_id"],
-      branch_id: table?.["branch_id"] ?? null,
+      session_id: sessionId,
       amount: l["amount"],
-      original_amount: l["amount"],
       discount_amount: 0,
       payment_method,
       tip_amount: 0,
       card_id: card_id ?? null,
       status: "completed",
-      paid_by: userId ?? null,
-      payment_link_id: linkId,
-      completed_at: new Date().toISOString(),
-      created_at: new Date().toISOString(),
+      user_id: userId ?? null,
+      completed_at: completedAt,
+      created_at: completedAt,
+      ...(isDigital ? { bancard_process_id: `PLACEHOLDER-${Date.now()}` } : {}),
     })
     .select("*")
     .single();
@@ -484,20 +597,28 @@ export const completePaymentLink = async (params: {
     throw createError(paymentError?.message ?? "Payment failed", 500, "PAYMENT_FAILED");
   }
 
-  await supabaseAdmin.from("payment_links").update({ status: "used" }).eq("id", linkId);
+  await supabaseAdmin
+    .from("payment_links")
+    .update({ status: "used", used_at: completedAt, used_by: userId ?? null })
+    .eq("id", linkId);
 
+  const paymentId = (payment as Record<string, unknown>)["id"] as string;
   const receiptNumber = generateReceiptNumber(branchShort);
   const { data: receipt } = await supabaseAdmin
     .from("payment_receipts")
     .insert({
-      payment_id: (payment as Record<string, unknown>)["id"],
+      payment_id: paymentId,
       receipt_number: receiptNumber,
-      issued_at: new Date().toISOString(),
     })
     .select("*")
     .single();
 
-  return { ...(payment as object), receipt };
+  // A link payment is a real digital payment, so it raises the same alert.
+  if (isDigital) {
+    await notifyWaiterOfDigitalPayment({ sessionId, branchId, tableId, paymentId });
+  }
+
+  return { ...(payment as object), original_amount: l["amount"], receipt };
 };
 
 export const createInvoice = async (params: {
@@ -511,7 +632,7 @@ export const createInvoice = async (params: {
 
   const { data: session, error: sessionError } = await supabaseAdmin
     .from("table_sessions")
-    .select("id, tables(branch_id, branches(short_name, allows_split_invoice))")
+    .select("id, status, branch_id, tables(branch_id, branches(name, allows_split_invoice))")
     .eq("id", sessionId)
     .single();
 
@@ -519,52 +640,46 @@ export const createInvoice = async (params: {
     throw createError("Session not found", 404, "SESSION_NOT_FOUND");
   }
 
-  const table = (session as Record<string, unknown>)["tables"] as Record<string, unknown> | null;
+  const sessionRow = session as Record<string, unknown>;
+  const table = sessionRow["tables"] as Record<string, unknown> | null;
   const branch = table?.["branches"] as Record<string, unknown> | null;
-  const branchShort = (branch?.["short_name"] as string | undefined) ?? "QR";
+  const branchId =
+    (sessionRow["branch_id"] as string | null) ?? (table?.["branch_id"] as string | null) ?? null;
+  const branchShort = branchShortCode(branch?.["name"] as string | undefined);
   const allowsSplit = branch?.["allows_split_invoice"] as boolean | undefined;
 
-  const { data: orders } = await supabaseAdmin
-    .from("orders")
-    .select("total_amount")
-    .eq("session_id", sessionId)
-    .neq("status", "cancelled");
+  const balance = await computeSessionBalance(sessionId);
 
-  const { data: payments } = await supabaseAdmin
-    .from("payments")
-    .select("amount")
-    .eq("session_id", sessionId)
-    .eq("status", "completed");
-
-  const totalOrdered = (orders ?? []).reduce(
-    (sum: number, o: Record<string, unknown>) => sum + ((o["total_amount"] as number) ?? 0),
-    0,
-  );
-  const totalPaid = (payments ?? []).reduce(
-    (sum: number, p: Record<string, unknown>) => sum + ((p["amount"] as number) ?? 0),
-    0,
-  );
-
-  if (totalPaid < totalOrdered) {
-    throw createError("Cannot issue invoice: session is not fully paid", 400, "UNPAID_BALANCE");
+  if (!balance.is_settled) {
+    throw createError(
+      "Cannot issue invoice: session is not fully paid",
+      400,
+      "UNPAID_BALANCE",
+      {
+        remaining: balance.remaining,
+        pending_participant_count: balance.pending_participant_count,
+      },
+    );
   }
 
   const invoiceNumber = await generateInvoiceNumber(branchShort);
   const invoiceType = allowsSplit && billing_profile_id ? "individual" : "single";
+  const issuedAt = new Date().toISOString();
 
   const { data, error } = await supabaseAdmin
     .from("invoices")
     .insert({
       session_id: sessionId,
-      branch_id: table?.["branch_id"] ?? null,
+      branch_id: branchId,
       invoice_number: invoiceNumber,
       invoice_type: invoiceType,
       billing_profile_id: billing_profile_id ?? null,
       customer_name: customer_name ?? null,
       ruc: ruc ?? null,
-      total_amount: totalOrdered,
-      created_by: userId,
-      created_at: new Date().toISOString(),
+      total_amount: balance.total_ordered,
+      status: "issued",
+      issued_at: issuedAt,
+      created_at: issuedAt,
     })
     .select("*")
     .single();
@@ -573,10 +688,38 @@ export const createInvoice = async (params: {
     throw createError(error?.message ?? "Failed to create invoice", 500, "INVOICE_FAILED");
   }
 
-  return data;
+  // A 'single' invoice is the fiscal close of the whole table, so it closes the
+  // session. 'individual' / split invoices are per-diner and must NEVER close it.
+  // The invoice row already exists and PostgREST offers no transaction to roll
+  // it back, so a failed close is surfaced to the caller instead of hidden.
+  let session_closed = false;
+  let close_error: string | null = null;
+
+  if (invoiceType === "single" && sessionRow["status"] === "active") {
+    try {
+      await closeSession(sessionId, userId);
+      session_closed = true;
+    } catch (err) {
+      close_error = err instanceof Error ? err.message : "Unknown error";
+      logger.error({ err, sessionId }, "invoice issued but session auto-close failed");
+    }
+  }
+
+  return {
+    ...(data as object),
+    session_closed,
+    ...(close_error
+      ? {
+          close_error,
+          message: "Invoice issued, but the table could not be closed. Close it manually.",
+        }
+      : {}),
+  };
 };
 
 export const getSessionInvoices = async (sessionId: string): Promise<object[]> => {
+  await assertSessionExists(sessionId);
+
   const { data, error } = await supabaseAdmin
     .from("invoices")
     .select("*")

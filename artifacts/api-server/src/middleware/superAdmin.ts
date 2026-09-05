@@ -1,5 +1,5 @@
 import { type Request, type Response, type NextFunction } from "express";
-import { supabaseAdmin } from "../config/supabase.js";
+import { supabaseAdmin, supabaseAuth } from "../config/supabase.js";
 import { createError } from "./errorHandler.js";
 
 export interface SuperAdminContext {
@@ -33,7 +33,7 @@ export const requireSuperAdmin = async (
     }
 
     const token = authHeader.slice(7);
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    const { data, error } = await supabaseAuth.auth.getUser(token);
 
     if (error || !data.user) {
       return next(createError("Invalid or expired token", 401, "INVALID_TOKEN"));

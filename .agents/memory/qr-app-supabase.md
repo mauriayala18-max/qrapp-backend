@@ -25,6 +25,32 @@ description: Durable gotchas and conventions for the QR App restaurant API (arti
 - **Why:** The panel spec differentiates admin-only vs admin/manager vs any-employee
   endpoints, which the base middleware doesn't enforce.
 
+## Shared client auth contamination (critical)
+- `supabase-js` mutates a client's in-memory Authorization header when you call
+  `auth.getUser(token)`, `auth.signInWithPassword`, or `auth.signInWithIdToken`. After
+  such a call on a client, its subsequent `.from()` queries run AS THAT USER (RLS-bound),
+  NOT as service-role — silently returning empty result sets once RLS is enforced.
+- **Why:** This caused PIN session join to return TABLE_NOT_FOUND in prod: middleware
+  verified the token via `supabaseAdmin.auth.getUser`, contaminating the singleton, so the
+  later service-role `.from("table_sessions")` query was RLS-filtered to nothing.
+- **How to apply:** Keep a dedicated `supabaseAuth` client (anon key, persistSession:false)
+  for ALL `.auth.getUser/signInWith*` calls; never run those on `supabaseAdmin`. Reserve
+  `supabaseAdmin` for `.from()` data queries and `auth.admin.*` (the admin API uses the
+  service key explicitly and does NOT mutate session state, so it's safe to keep there).
+  `persistSession:false` alone does NOT prevent the in-memory header mutation — only a
+  separate client instance isolates it.
+
+## Dev and prod share the same external Supabase
+- The development workflow and the autoscale production deployment use the SAME
+  Supabase secrets (SUPABASE_URL / ANON / SERVICE_ROLE are identical across the dev and
+  prod env sets) and therefore the SAME external database.
+- **Why it matters:** Identical code must behave identically in dev and prod. If a fix
+  works locally but prod still shows the old behavior, it is NOT an env/RLS difference —
+  prod is serving a STALE build. Verify with `listDeploymentBuilds`: compare the latest
+  build's timestamp against when the fix was committed. No build after the fix = the user
+  never completed a fresh publish; republishing is the fix (the build/run config is fine).
+- `/api/healthz` exposes a `build` marker field for confirming a fresh build is live.
+
 ## Module pattern
 - Each module = `service.ts` -> `controller.ts` -> `routes.ts`, registered in
   `src/routes/index.ts`. Two routers can mount at the same base (e.g. both the legacy
