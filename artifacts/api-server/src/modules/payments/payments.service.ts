@@ -23,21 +23,30 @@ const assertSessionExists = async (sessionId: string): Promise<void> => {
 };
 
 /**
+ * Reported back on the payment response so a failed alert is visible to the
+ * caller instead of dying in the server log.
+ */
+export type WaiterAlertOutcome =
+  | { created: true; alert_id: string; recipient_employee_id: string | null }
+  | { created: false; code: string | null; message: string; hint: string };
+
+/**
  * A completed DIGITAL payment (card / apple_pay / google_pay) raises a
  * `payment_received` alert for the waiter. Cash and POS are handed to an
  * employee in person, so they raise nothing.
  *
- * Requires `payment_received` to be allowed by the
- * `restaurant_alerts_alert_type_check` CHECK constraint (see the migration
- * shipped with this change). A failing alert must never roll back a payment
- * that already succeeded, so the error is logged, not thrown.
+ * `payment_received` must be permitted by the
+ * `restaurant_alerts_alert_type_check` CHECK constraint - see
+ * artifacts/api-server/migrations/. Until that runs, Postgres rejects the row
+ * with SQLSTATE 23514. A failing alert must never roll back a payment that
+ * already succeeded, so the failure is returned, never thrown.
  */
 const notifyWaiterOfDigitalPayment = async (params: {
   sessionId: string;
   branchId: string | null;
   tableId: string | null;
   paymentId: string;
-}): Promise<void> => {
+}): Promise<WaiterAlertOutcome> => {
   const { sessionId, branchId, tableId, paymentId } = params;
 
   let assignedWaiterId: string | null = null;
@@ -55,23 +64,69 @@ const notifyWaiterOfDigitalPayment = async (params: {
       null;
   }
 
-  const { error } = await supabaseAdmin.from("restaurant_alerts").insert({
-    branch_id: branchId,
-    alert_type: "payment_received",
-    reference_type: "session",
-    reference_id: sessionId,
-    recipient_role: "waiter",
-    recipient_employee_id: assignedWaiterId,
-    status: "pending",
-    created_at: new Date().toISOString(),
-  });
+  // restaurant_alerts.branch_id is NOT NULL, so never rely on the caller
+  // having resolved it.
+  let resolvedBranchId = branchId;
+  if (!resolvedBranchId) {
+    const { data: sessionRow } = await supabaseAdmin
+      .from("table_sessions")
+      .select("branch_id, tables(branch_id)")
+      .eq("id", sessionId)
+      .maybeSingle();
 
-  if (error) {
+    const row = sessionRow as Record<string, unknown> | null;
+    resolvedBranchId =
+      (row?.["branch_id"] as string | null) ??
+      ((row?.["tables"] as Record<string, unknown> | null)?.["branch_id"] as string | null) ??
+      null;
+  }
+
+  if (!resolvedBranchId) {
+    const outcome: WaiterAlertOutcome = {
+      created: false,
+      code: "BRANCH_UNRESOLVED",
+      message: "Could not resolve branch_id for the session",
+      hint: "restaurant_alerts.branch_id is NOT NULL; the session has no branch and no table branch.",
+    };
+    logger.error({ sessionId, paymentId }, "payment_received alert skipped: no branch_id");
+    return outcome;
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("restaurant_alerts")
+    .insert({
+      branch_id: resolvedBranchId,
+      alert_type: "payment_received",
+      reference_type: "session",
+      reference_id: sessionId,
+      recipient_role: "waiter",
+      recipient_employee_id: assignedWaiterId,
+      status: "pending",
+      created_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (error || !data) {
+    const code = (error as { code?: string } | null)?.code ?? null;
+    const hint =
+      code === "23514"
+        ? "The restaurant_alerts_alert_type_check constraint still rejects 'payment_received'. Run artifacts/api-server/migrations/20260905_allow_payment_received_alert_type.sql in the Supabase SQL editor."
+        : "See the API logs for the full PostgREST error.";
+
     logger.error(
-      { err: error, sessionId, paymentId },
+      { err: error, code, sessionId, paymentId, branchId: resolvedBranchId },
       "payment_received alert insert failed (the payment itself succeeded)",
     );
+
+    return { created: false, code, message: error?.message ?? "Alert insert failed", hint };
   }
+
+  return {
+    created: true,
+    alert_id: (data as Record<string, unknown>)["id"] as string,
+    recipient_employee_id: assignedWaiterId,
+  };
 };
 
 const generateReceiptNumber = (branchShort: string): string => {
@@ -234,9 +289,9 @@ export const createPayment = async (params: {
     .select("*")
     .single();
 
-  if (isDigital) {
-    await notifyWaiterOfDigitalPayment({ sessionId: session_id, branchId, tableId, paymentId });
-  }
+  const waiter_alert = isDigital
+    ? await notifyWaiterOfDigitalPayment({ sessionId: session_id, branchId, tableId, paymentId })
+    : null;
 
   return {
     ...(payment as object),
@@ -244,6 +299,7 @@ export const createPayment = async (params: {
     benefit_name: benefitName,
     billing_profile_id: billing_profile_id ?? null,
     receipt,
+    waiter_alert,
   };
 };
 
@@ -614,11 +670,11 @@ export const completePaymentLink = async (params: {
     .single();
 
   // A link payment is a real digital payment, so it raises the same alert.
-  if (isDigital) {
-    await notifyWaiterOfDigitalPayment({ sessionId, branchId, tableId, paymentId });
-  }
+  const waiter_alert = isDigital
+    ? await notifyWaiterOfDigitalPayment({ sessionId, branchId, tableId, paymentId })
+    : null;
 
-  return { ...(payment as object), original_amount: l["amount"], receipt };
+  return { ...(payment as object), original_amount: l["amount"], receipt, waiter_alert };
 };
 
 export const createInvoice = async (params: {
