@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 
 export const getBranchMenu = async (params: {
   branchId: string;
@@ -389,8 +390,8 @@ export const createProduct = async (params: {
     entity_type: "product",
     entity_id: productId,
     change_type: "create",
-    changed_by: employeeId,
-    created_at: new Date().toISOString(),
+    changed_by: await resolveEmployeeId(employeeId),
+    changed_at: new Date().toISOString(),
   });
 
   return await getProductDetail(productId);
@@ -430,18 +431,44 @@ export const updateProduct = async (params: {
     throw createError(error?.message ?? "Product not found", 404, "NOT_FOUND");
   }
 
+  // The map below is synchronous, so the actor has to be resolved up front.
+  // changed_by is the acting employees.id, never the auth user id.
+  const actorEmployeeId = await resolveEmployeeId(employeeId);
+
+  // branch_id is a real FK to branches.id - the product's category_id is NOT
+  // a branch id, so resolve the branch through the category. Read it from the
+  // UPDATED row so that moving a product between categories logs the change
+  // under the branch it now belongs to.
+  const finalCategoryId = (data as Record<string, unknown>)["category_id"] as string | null;
+  const { data: logCategory, error: logCategoryError } = await supabaseAdmin
+    .from("menu_categories")
+    .select("branch_id")
+    .eq("id", finalCategoryId as string)
+    .maybeSingle();
+
+  if (logCategoryError || !logCategory) {
+    throw createError(
+      logCategoryError?.message ?? "Could not resolve the product's branch for the change log",
+      500,
+      "BRANCH_UNRESOLVED",
+    );
+  }
+
+  const changedAt = new Date().toISOString();
+
   const changedFields = Object.entries(updates)
     .filter(([key, val]) => existing && (existing as Record<string, unknown>)[key] !== val)
     .map(([key, val]) => ({
-      branch_id: (existing as Record<string, unknown>)?.["category_id"],
+      branch_id: (logCategory as Record<string, unknown> | null)?.["branch_id"] ?? null,
       entity_type: "product",
       entity_id: productId,
       change_type: "update",
-      field_name: key,
+      // the column is `field_changed`, not `field_name`
+      field_changed: key,
       old_value: JSON.stringify((existing as Record<string, unknown>)[key]),
       new_value: JSON.stringify(val),
-      changed_by: employeeId,
-      created_at: new Date().toISOString(),
+      changed_by: actorEmployeeId,
+      changed_at: changedAt,
     }));
 
   if (changedFields.length) {
@@ -483,8 +510,8 @@ export const toggleProductAvailability = async (params: {
     entity_id: productId,
     change_type: "availability",
     new_value: JSON.stringify(is_available),
-    changed_by: employeeId,
-    created_at: new Date().toISOString(),
+    changed_by: await resolveEmployeeId(employeeId),
+    changed_at: new Date().toISOString(),
   });
 
   return data;
@@ -518,8 +545,8 @@ export const softDeleteProduct = async (params: {
     entity_type: "product",
     entity_id: productId,
     change_type: "delete",
-    changed_by: employeeId,
-    created_at: new Date().toISOString(),
+    changed_by: await resolveEmployeeId(employeeId),
+    changed_at: new Date().toISOString(),
   });
 };
 
@@ -553,8 +580,8 @@ export const createCategory = async (params: {
     entity_type: "category",
     entity_id: (data as Record<string, unknown>)["id"],
     change_type: "create",
-    changed_by: employeeId,
-    created_at: new Date().toISOString(),
+    changed_by: await resolveEmployeeId(employeeId),
+    changed_at: new Date().toISOString(),
   });
 
   return data;
@@ -584,8 +611,8 @@ export const updateCategory = async (params: {
     entity_id: categoryId,
     change_type: "update",
     new_value: JSON.stringify(updates),
-    changed_by: employeeId,
-    created_at: new Date().toISOString(),
+    changed_by: await resolveEmployeeId(employeeId),
+    changed_at: new Date().toISOString(),
   });
 
   return data;
@@ -604,7 +631,7 @@ export const getChangeLog = async (params: {
     .from("menu_change_log")
     .select("*", { count: "exact" })
     .eq("branch_id", branchId)
-    .order("created_at", { ascending: false })
+    .order("changed_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
   if (entity_type) {

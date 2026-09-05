@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { logger } from "../../lib/logger.js";
+import { resolveEmployeeId, resolveParticipantId } from "../../lib/actors.js";
 
 export const callWaiter = async (params: {
   sessionId: string;
@@ -28,10 +29,13 @@ export const callWaiter = async (params: {
   const branchId =
     (sessionRow["branch_id"] as string | null) ?? (table?.["branch_id"] as string | null) ?? null;
 
-  // `called_by` is NOT NULL: a guest with no account cannot raise a call.
+  // `called_by` is NOT NULL and is a FK to session_participants.id - the
+  // diner's participant row in THIS session, not their auth user id.
   if (!userId) {
     throw createError("A signed-in user is required to call the waiter", 401, "UNAUTHORIZED");
   }
+
+  const calledByParticipantId = await resolveParticipantId(sessionId, userId);
 
   const { data: call, error: callError } = await supabaseAdmin
     .from("waiter_calls")
@@ -39,7 +43,7 @@ export const callWaiter = async (params: {
       session_id: sessionId,
       table_id: tableId,
       branch_id: branchId,
-      called_by: userId,
+      called_by: calledByParticipantId,
       reason_id: reason_id ?? null,
       custom_reason: custom_reason ?? null,
       status: "pending",
@@ -125,6 +129,11 @@ export const updateWaiterCall = async (params: {
 }): Promise<object> => {
   const { callId, status, employeeId } = params;
 
+  // attended_by and the mirrored restaurant_alerts.resolved_by /
+  // acknowledged_by all identify a member of staff by employees.id, never by
+  // the auth user id on req.user.id.
+  const actorEmployeeId = await resolveEmployeeId(employeeId);
+
   const timestampField: Record<string, string> = {
     acknowledged: "acknowledged_at",
     resolved: "resolved_at",
@@ -134,7 +143,7 @@ export const updateWaiterCall = async (params: {
     .from("waiter_calls")
     .update({
       status,
-      attended_by: employeeId,
+      attended_by: actorEmployeeId,
       [timestampField[status]]: new Date().toISOString(),
     })
     .eq("id", callId)
@@ -150,8 +159,8 @@ export const updateWaiterCall = async (params: {
     .from("restaurant_alerts")
     .update(
       status === "resolved"
-        ? { status: "resolved", resolved_by: employeeId, resolved_at: now }
-        : { status: "acknowledged", acknowledged_by: employeeId, acknowledged_at: now },
+        ? { status: "resolved", resolved_by: actorEmployeeId, resolved_at: now }
+        : { status: "acknowledged", acknowledged_by: actorEmployeeId, acknowledged_at: now },
     )
     .eq("reference_id", callId)
     .eq("reference_type", "waiter_call")

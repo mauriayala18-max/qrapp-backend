@@ -3,24 +3,13 @@ import { createError } from "../../middleware/errorHandler.js";
 import { closeGroupForSession } from "../table-groups/table-groups.service.js";
 import { computeSessionBalance } from "../payments/balance.service.js";
 import { logger } from "../../lib/logger.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 
 const generateToken = () =>
   Math.random().toString(36).substring(2, 12).toUpperCase();
 
 const generatePin = () =>
   Math.floor(1000 + Math.random() * 9000).toString();
-
-/** `closed_by` / audit actors are employees.id, not the auth user id. */
-const resolveEmployeeId = async (authUserId: string): Promise<string> => {
-  const { data } = await supabaseAdmin
-    .from("employees")
-    .select("id")
-    .eq("auth_user_id", authUserId)
-    .eq("is_active", true)
-    .maybeSingle();
-
-  return ((data as Record<string, unknown> | null)?.["id"] as string | undefined) ?? authUserId;
-};
 
 /**
  * Lazily open a session for a table that is currently free. A freed table has

@@ -1,6 +1,8 @@
 import { randomBytes, randomInt } from "node:crypto";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
+import { logger } from "../../lib/logger.js";
 
 const startOfToday = (): string => {
   const d = new Date();
@@ -275,7 +277,11 @@ export const createEmployee = async (params: {
   const { data: employee, error: empError } = await supabaseAdmin
     .from("employees")
     .insert({
-      user_id: userId,
+      // The link to Supabase Auth is `auth_user_id`. There is no `user_id`
+      // column on employees - writing it made the insert fail outright, and
+      // any employee created that way could never be resolved back from an
+      // auth session.
+      auth_user_id: userId,
       full_name,
       email,
       phone: phone ?? null,
@@ -617,14 +623,24 @@ export const updateBranchSettings = async (params: {
     throw createError(error?.message ?? "Branch not found", 404, "NOT_FOUND");
   }
 
-  await supabaseAdmin.from("audit_log").insert({
-    actor_id: employeeId,
+  // audit_log requires actor_type and log_level, and its columns are
+  // reference_type / reference_id / new_value - not entity_type / entity_id /
+  // changes. actor_id records the employee, so it needs the resolved id.
+  const { error: auditError } = await supabaseAdmin.from("audit_log").insert({
+    actor_type: "employee",
+    actor_id: await resolveEmployeeId(employeeId),
     action: "update_branch_settings",
-    entity_type: "branch",
-    entity_id: branchId,
-    changes: allowed,
+    module: "panel",
+    reference_type: "branch",
+    reference_id: branchId,
+    log_level: "full",
+    new_value: allowed,
     created_at: new Date().toISOString(),
   });
+
+  if (auditError) {
+    logger.error({ err: auditError, branchId }, "update_branch_settings audit_log insert failed");
+  }
 
   return data;
 };
@@ -825,14 +841,19 @@ export const updateAlert = async (params: {
 }): Promise<object> => {
   const { alertId, status, employeeId } = params;
 
+  // acknowledged_by / resolved_by are FKs to employees.id, NOT the auth user
+  // id that arrives on req.user.id. Writing the auth id makes Postgres reject
+  // the update outright.
+  const actorEmployeeId = await resolveEmployeeId(employeeId);
+
   const update: Record<string, unknown> = { status };
   const now = new Date().toISOString();
 
   if (status === "acknowledged") {
-    update["acknowledged_by"] = employeeId;
+    update["acknowledged_by"] = actorEmployeeId;
     update["acknowledged_at"] = now;
   } else {
-    update["resolved_by"] = employeeId;
+    update["resolved_by"] = actorEmployeeId;
     update["resolved_at"] = now;
   }
 

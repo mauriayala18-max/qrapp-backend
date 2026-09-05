@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { resolveEmployeeId as getEmployeeId } from "../../lib/actors.js";
 
 const generateToken = () =>
   Math.random().toString(36).substring(2, 12).toUpperCase();
@@ -39,19 +40,6 @@ const createSessionForTable = async (table: TableRow): Promise<void> => {
     .eq("id", table.id);
 };
 
-const getEmployeeId = async (authUserId: string): Promise<string> => {
-  const { data, error } = await supabaseAdmin
-    .from("employees")
-    .select("id")
-    .eq("auth_user_id", authUserId)
-    .eq("is_active", true)
-    .maybeSingle();
-
-  if (error || !data) {
-    throw createError("Employee not found", 403, "FORBIDDEN");
-  }
-  return data.id as string;
-};
 
 export const createTableGroup = async (params: {
   branchId: string;

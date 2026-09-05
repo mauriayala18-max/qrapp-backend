@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 
 export const createReservation = async (params: {
   user_id: string;
@@ -118,8 +119,10 @@ export const updateReservation = async (params: {
   };
 
   if (status === "confirmed") {
-    update["confirmed_by"] = employeeId;
-    update["confirmed_at"] = new Date().toISOString();
+    // reservations.confirmed_by holds employees.id, not the auth user id.
+    // There is no `confirmed_at` column on reservations - `updated_at` above
+    // already carries the timestamp.
+    update["confirmed_by"] = await resolveEmployeeId(employeeId);
   }
 
   const { data, error } = await supabaseAdmin

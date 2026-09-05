@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 
 interface OrderItem {
   product_id: string;
@@ -421,7 +422,8 @@ export const handleCancellationRequest = async (params: {
     .update({
       status,
       rejection_reason: rejection_reason ?? null,
-      resolved_by: employeeId,
+      // cancellation_requests.resolved_by identifies staff by employees.id.
+      resolved_by: await resolveEmployeeId(employeeId),
       resolved_at: new Date().toISOString(),
     })
     .eq("id", requestId)

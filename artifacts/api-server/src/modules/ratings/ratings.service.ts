@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { earnPoints, getConfiguredPointsAmount } from "../points/points.service.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 
 export const createDishRating = async (params: {
   userId: string;
@@ -288,11 +289,34 @@ export const respondToReview = async (params: {
 }): Promise<object> => {
   const { reviewId, employeeId, response_text } = params;
 
+  // review_responses.branch_id is a required FK to branches.id, and the
+  // responder column is `responded_by` (an employees.id), not `employee_id`.
+  const { data: review } = await supabaseAdmin
+    .from("dish_reviews")
+    .select("id, products(category_id, menu_categories(branch_id))")
+    .eq("id", reviewId)
+    .maybeSingle();
+
+  const product = (review as Record<string, unknown> | null)?.["products"] as
+    | Record<string, unknown>
+    | null;
+  const category = product?.["menu_categories"] as Record<string, unknown> | null;
+  const branchId = (category?.["branch_id"] as string | undefined) ?? null;
+
+  if (!branchId) {
+    throw createError(
+      "Could not resolve the branch for this review",
+      404,
+      "BRANCH_UNRESOLVED",
+    );
+  }
+
   const { data, error } = await supabaseAdmin
     .from("review_responses")
     .insert({
       review_id: reviewId,
-      employee_id: employeeId,
+      branch_id: branchId,
+      responded_by: await resolveEmployeeId(employeeId),
       response_text,
       created_at: new Date().toISOString(),
     })
