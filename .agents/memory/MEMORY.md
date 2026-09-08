@@ -1,4 +1,5 @@
 - [QR App Supabase backend](qr-app-supabase.md) — service_role grant gotchas, role gating via requireRole, module pattern for artifacts/api-server.
 - [QR App code-vs-schema drift](qr-app-schema-drift.md) — no migrations/types; the live Supabase schema is authoritative, verify columns and CHECK values before any insert.
 - [QR App session settlement](qr-app-session-settlement.md) — one balance helper owns close/invoice/payments; tips excluded, reimbursements don't settle, verify the post-close invariant.
+- [QR App actor id spaces](qr-app-id-spaces.md) — controllers pass the auth id as `employeeId`; resolve to employees.id / session_participants.id before any `*_by` write.
 - [GitHub push via connector API](github-push-via-connector.md) — git is blocked; push via GitHub REST API, and fetch connector secrets without the connector_names filter (it can falsely return 0).

@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
-import { resolveEmployeeId } from "../../lib/actors.js";
+import { resolveEmployeeId, resolveParticipantId } from "../../lib/actors.js";
+import { logger } from "../../lib/logger.js";
 
 interface OrderItem {
   product_id: string;
@@ -15,11 +16,10 @@ const buildOrder = async (params: {
   items: OrderItem[];
   notes?: string;
   order_type: string;
-  created_by_employee?: string;
   user_id?: string;
   requested_time?: string;
 }): Promise<object> => {
-  const { session_id, branch_id, items, notes, order_type, created_by_employee, user_id, requested_time } = params;
+  const { session_id, branch_id, items, notes, order_type, user_id, requested_time } = params;
 
   let resolvedBranchId = branch_id;
 
@@ -70,7 +70,9 @@ const buildOrder = async (params: {
 
   if (session_id) orderInsert["session_id"] = session_id;
   if (resolvedBranchId) orderInsert["branch_id"] = resolvedBranchId;
-  if (created_by_employee) orderInsert["created_by_employee"] = created_by_employee;
+  // `orders` has NO staff-actor column - created_by_employee does not exist,
+  // and writing it made every employee-created order fail. Traditional orders
+  // record their author in audit_log instead (see createTraditionalOrder).
   if (user_id) orderInsert["user_id"] = user_id;
   if (requested_time) orderInsert["requested_time"] = requested_time;
 
@@ -160,13 +162,43 @@ export const createTraditionalOrder = async (params: {
   notes?: string;
   employee_id: string;
 }): Promise<object> => {
-  return buildOrder({
+  // Resolve first: a caller with no active employee row is refused before any
+  // row is written, rather than after a partially-built order.
+  const employeeId = await resolveEmployeeId(params.employee_id);
+
+  const order = (await buildOrder({
     session_id: params.session_id,
     items: params.items,
     notes: params.notes,
     order_type: "traditional",
-    created_by_employee: params.employee_id,
+  })) as Record<string, unknown>;
+
+  // `orders` has no column for the staff member who took the order, so the
+  // attribution lives in audit_log. Non-fatal: the order itself is already in.
+  const { error: auditError } = await supabaseAdmin.from("audit_log").insert({
+    actor_type: "employee",
+    actor_id: employeeId,
+    action: "create_traditional_order",
+    module: "orders",
+    reference_type: "order",
+    reference_id: order["id"],
+    log_level: "full",
+    new_value: {
+      order_type: "traditional",
+      session_id: params.session_id,
+      total_amount: order["total_amount"] ?? null,
+    },
+    created_at: new Date().toISOString(),
   });
+
+  if (auditError) {
+    logger.error(
+      { err: auditError, orderId: order["id"] },
+      "create_traditional_order audit_log insert failed",
+    );
+  }
+
+  return order;
 };
 
 export const createAnticipatoryOrder = async (params: {
@@ -340,7 +372,7 @@ export const cancelOrder = async (params: {
 
   const { data: order, error: orderError } = await supabaseAdmin
     .from("orders")
-    .select("id, status")
+    .select("id, status, session_id")
     .eq("id", orderId)
     .single();
 
@@ -355,13 +387,29 @@ export const cancelOrder = async (params: {
   }
 
   if (status === "in_preparation") {
+    const sessionId = (order as Record<string, unknown>)["session_id"] as string | null;
+
+    if (!sessionId) {
+      throw createError(
+        "This order is not attached to a session, so no cancellation request can be raised",
+        400,
+        "SESSION_REQUIRED",
+      );
+    }
+
     const { data: request, error: reqError } = await supabaseAdmin
       .from("cancellation_requests")
       .insert({
         order_id: orderId,
-        item_id: item_id ?? null,
+        // Real columns are order_item_id (FK order_items.id) and
+        // requested_by_participant (FK session_participants.id) - the insert
+        // used to write `item_id` and `requested_by` with an auth id, neither
+        // of which exists. request_type is REQUIRED and was never written; its
+        // CHECK allows only 'cancellation' | 'modification'.
+        order_item_id: item_id ?? null,
+        request_type: "cancellation",
+        requested_by_participant: await resolveParticipantId(sessionId, userId),
         reason: reason ?? null,
-        requested_by: userId,
         status: "pending",
         created_at: new Date().toISOString(),
       })
@@ -436,7 +484,7 @@ export const handleCancellationRequest = async (params: {
 
   if (status === "approved") {
     const orderId = (request as Record<string, unknown>)["order_id"] as string;
-    const itemId = (request as Record<string, unknown>)["item_id"] as string | null;
+    const itemId = (request as Record<string, unknown>)["order_item_id"] as string | null;
 
     if (itemId) {
       await supabaseAdmin

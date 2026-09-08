@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { logger } from "../../lib/logger.js";
+import { resolveParticipantId } from "../../lib/actors.js";
 import { computeSessionBalance } from "./balance.service.js";
 import { closeSession } from "../sessions/sessions.service.js";
 
@@ -555,7 +556,11 @@ export const createPaymentLink = async (params: {
       url,
       status: "active",
       expires_at: expiresAt,
-      created_by: userId,
+      // generated_by is REQUIRED and FKs to session_participants.id - it was
+      // never written, so no payment link could be created. `created_by` has
+      // no FK and no defined id space, and it was receiving the auth id; the
+      // canonical actor is generated_by, so we no longer write it.
+      generated_by: await resolveParticipantId(sessionId, userId),
       created_at: new Date().toISOString(),
     })
     .select("*")

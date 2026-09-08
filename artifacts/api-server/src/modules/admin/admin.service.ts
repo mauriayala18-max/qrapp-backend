@@ -708,7 +708,8 @@ export const updatePlatformAlert = async (params: {
     .update({
       status,
       acknowledged_by: superAdminId,
-      acknowledged_at: now().toISOString(),
+      // platform_alerts has no acknowledged_at column; `status` plus
+      // acknowledged_by carry the state.
     })
     .eq("id", alertId)
     .select()
@@ -752,7 +753,9 @@ export const createCommunication = async (params: {
       body,
       channel,
       status: "draft",
-      created_by: superAdminId,
+      // The required column is `sent_by` (FK to super_admins.id). There is no
+      // `created_by` column on mass_communications, so the insert always failed.
+      sent_by: superAdminId,
     })
     .select()
     .single();
