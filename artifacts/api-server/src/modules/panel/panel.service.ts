@@ -756,8 +756,10 @@ export const createTable = async (params: {
       table_number,
       capacity: capacity ?? null,
       qr_code_url: qrCodeUrl,
-      token,
-      pin,
+      // The real columns are current_session_token / current_pin; `token` and
+      // `pin` do not exist, so creating a table failed outright.
+      current_session_token: token,
+      current_pin: pin,
       is_active: true,
       created_at: new Date().toISOString(),
     })

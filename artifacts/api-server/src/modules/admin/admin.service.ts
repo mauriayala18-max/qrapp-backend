@@ -829,10 +829,15 @@ export const updateConfig = async (params: {
     module: "global_configuration",
     action: "update_config",
     log_level: "full",
-    entity_type: "global_configuration",
-    entity_id: key,
-    old_value: oldValue,
-    new_value: value,
+    // audit_log has reference_type / reference_id, not entity_type / entity_id,
+    // so this insert always failed and every successful config update then
+    // reported AUDIT_LOG_FAILED back to the caller. reference_id is a uuid
+    // column and a configuration key is text, so the key travels in the logged
+    // json values instead of the reference.
+    reference_type: "global_configuration",
+    reference_id: null,
+    old_value: { key, value: oldValue },
+    new_value: { key, value },
     created_at: now().toISOString(),
   });
 

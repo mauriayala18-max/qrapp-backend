@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { redeemPoints } from "../points/points.service.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 
 const generateCouponCode = (): string => {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -290,8 +291,10 @@ export const createCoupon = async (params: {
   cap_amount?: number;
   expires_at: string;
   reason: string;
+  employeeId: string;
 }): Promise<object> => {
-  const { branchId, user_id, coupon_type, value, cap_amount, expires_at, reason } = params;
+  const { branchId, user_id, coupon_type, value, cap_amount, expires_at, reason, employeeId } =
+    params;
 
   const code = generateCouponCode();
 
@@ -306,6 +309,9 @@ export const createCoupon = async (params: {
       cap_amount: cap_amount ?? null,
       expires_at,
       reason,
+      // created_by is REQUIRED and was never written, so no coupon could be
+      // issued. The route is employee-gated, so it holds an employees.id.
+      created_by: await resolveEmployeeId(employeeId),
       status: "active",
       created_at: new Date().toISOString(),
     })

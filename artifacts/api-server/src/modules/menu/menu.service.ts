@@ -313,9 +313,26 @@ export const createProduct = async (params: {
     employeeId,
   } = params;
 
+  // products.branch_id is REQUIRED and was never written, so creating a product
+  // always failed. The branch is a property of the category the product is in.
+  const { data: parentCategory, error: parentCategoryError } = await supabaseAdmin
+    .from("menu_categories")
+    .select("branch_id")
+    .eq("id", category_id)
+    .maybeSingle();
+
+  if (parentCategoryError || !parentCategory) {
+    throw createError(
+      parentCategoryError?.message ?? "Category not found",
+      404,
+      "CATEGORY_NOT_FOUND",
+    );
+  }
+
   const { data: product, error: prodError } = await supabaseAdmin
     .from("products")
     .insert({
+      branch_id: (parentCategory as Record<string, unknown>)["branch_id"],
       category_id,
       name,
       description,

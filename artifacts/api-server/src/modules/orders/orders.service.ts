@@ -389,13 +389,13 @@ export const cancelOrder = async (params: {
   if (status === "in_preparation") {
     const sessionId = (order as Record<string, unknown>)["session_id"] as string | null;
 
-    if (!sessionId) {
-      throw createError(
-        "This order is not attached to a session, so no cancellation request can be raised",
-        400,
-        "SESSION_REQUIRED",
-      );
-    }
+    // Anticipatory and pickup orders are created without a session, so there is
+    // no session_participants row to point at. requested_by_participant is
+    // nullable, so those orders can still raise a request - it simply carries no
+    // participant reference.
+    const requestedByParticipant = sessionId
+      ? await resolveParticipantId(sessionId, userId)
+      : null;
 
     const { data: request, error: reqError } = await supabaseAdmin
       .from("cancellation_requests")
@@ -408,7 +408,7 @@ export const cancelOrder = async (params: {
         // CHECK allows only 'cancellation' | 'modification'.
         order_item_id: item_id ?? null,
         request_type: "cancellation",
-        requested_by_participant: await resolveParticipantId(sessionId, userId),
+        requested_by_participant: requestedByParticipant,
         reason: reason ?? null,
         status: "pending",
         created_at: new Date().toISOString(),
@@ -429,13 +429,17 @@ export const cancelOrder = async (params: {
   if (item_id) {
     await supabaseAdmin
       .from("order_items")
-      .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
+      // order_items has no cancelled_at column (orders does) - including it
+      // made every item cancellation fail silently.
+      .update({ status: "cancelled" })
       .eq("id", item_id)
       .eq("order_id", orderId);
   } else {
     await supabaseAdmin
       .from("order_items")
-      .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
+      // order_items has no cancelled_at column (orders does) - including it
+      // made every item cancellation fail silently.
+      .update({ status: "cancelled" })
       .eq("order_id", orderId);
 
     await supabaseAdmin
@@ -489,12 +493,16 @@ export const handleCancellationRequest = async (params: {
     if (itemId) {
       await supabaseAdmin
         .from("order_items")
-        .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
+        // order_items has no cancelled_at column (orders does) - including it
+        // made every item cancellation fail silently.
+        .update({ status: "cancelled" })
         .eq("id", itemId);
     } else {
       await supabaseAdmin
         .from("order_items")
-        .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
+        // order_items has no cancelled_at column (orders does) - including it
+        // made every item cancellation fail silently.
+        .update({ status: "cancelled" })
         .eq("order_id", orderId);
 
       await supabaseAdmin

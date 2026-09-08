@@ -170,6 +170,7 @@ export const createCoupon = async (
       cap_amount,
       expires_at,
       reason,
+      employeeId: req.user!.id,
     });
 
     res.status(201).json({ data: result });

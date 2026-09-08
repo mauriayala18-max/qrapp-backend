@@ -99,7 +99,7 @@ export const createDishReview = async (params: {
 
   const { data: ratingRow } = await supabaseAdmin
     .from("dish_ratings")
-    .select("id, user_id")
+    .select("id, user_id, product_id")
     .eq("id", ratingId)
     .eq("user_id", userId)
     .single();
@@ -113,6 +113,9 @@ export const createDishReview = async (params: {
     .insert({
       rating_id: ratingId,
       user_id: userId,
+      // product_id is REQUIRED and was never written, so no review could be
+      // saved. It comes from the rating the review belongs to.
+      product_id: (ratingRow as Record<string, unknown>)["product_id"],
       review_text,
       status: "visible",
       created_at: new Date().toISOString(),
