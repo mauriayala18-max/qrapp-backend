@@ -1,12 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId as getEmployeeId } from "../../lib/actors.js";
-
-const generateToken = () =>
-  Math.random().toString(36).substring(2, 12).toUpperCase();
-
-const generatePin = () =>
-  Math.floor(1000 + Math.random() * 9000).toString();
+import { generateSessionToken, generateUniquePin } from "../../lib/session-credentials.js";
 
 type TableRow = {
   id: string;
@@ -16,8 +11,8 @@ type TableRow = {
 };
 
 const createSessionForTable = async (table: TableRow): Promise<void> => {
-  const token = generateToken();
-  const pin = generatePin();
+  const token = generateSessionToken();
+  const pin = await generateUniquePin();
 
   const { error: sessionError } = await supabaseAdmin
     .from("table_sessions")
@@ -119,8 +114,8 @@ export const createTableGroup = async (params: {
       .insert({
         table_id: firstTable.id,
         branch_id: branchId,
-        session_token: generateToken(),
-        pin: generatePin(),
+        session_token: generateSessionToken(),
+        pin: await generateUniquePin(),
         status: "active",
         opened_at: new Date().toISOString(),
       })
@@ -286,7 +281,19 @@ const releaseGroupTables = async (
   }
 
   if (createFreshSessions) {
+    // The group's shared session stays open until payment, and it is anchored
+    // to one of these tables. That table must not also get a fresh session, or
+    // it ends up running two at once.
+    const { data: stillOpen } = await supabaseAdmin
+      .from("table_sessions")
+      .select("table_id")
+      .in("table_id", tables.map((t) => t.id))
+      .eq("status", "active");
+
+    const busy = new Set(((stillOpen ?? []) as Array<Record<string, string>>).map((r) => r["table_id"]!));
+
     for (const table of tables) {
+      if (busy.has(table.id)) continue;
       await createSessionForTable(table);
     }
   }

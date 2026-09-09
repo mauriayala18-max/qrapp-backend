@@ -1,4 +1,4 @@
-import { randomBytes, randomInt } from "node:crypto";
+import { generateSessionToken, generateUniquePin } from "../../lib/session-credentials.js";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
@@ -745,8 +745,8 @@ export const createTable = async (params: {
 }): Promise<object> => {
   const { branchId, table_number, capacity } = params;
 
-  const token = randomBytes(16).toString("hex");
-  const pin = randomInt(1000, 9999).toString();
+  const token = generateSessionToken();
+  const pin = await generateUniquePin();
   const qrCodeUrl = `/t/${branchId}/${token}`;
 
   const { data, error } = await supabaseAdmin
