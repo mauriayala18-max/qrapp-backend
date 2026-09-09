@@ -1,7 +1,19 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
-import { resolveEmployeeId, resolveParticipantId } from "../../lib/actors.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
 import { logger } from "../../lib/logger.js";
+import {
+  assertCancellationAllowed,
+  assertCancellationRole,
+  authorizeStaffForOrder,
+  isItemPaid,
+  isOrderPaid,
+  loadOrderContext,
+  recordCancellationAudit,
+  resolveCancellationActor,
+  type CancellationActor,
+  type OrderContext,
+} from "./cancellation-policy.js";
 
 interface OrderItem {
   product_id: string;
@@ -243,10 +255,52 @@ export const createAnticipatoryOrder = async (params: {
   });
 };
 
-export const linkOrderToSession = async (
-  orderId: string,
-  sessionId: string,
-): Promise<object> => {
+export const linkOrderToSession = async (params: {
+  orderId: string;
+  sessionId: string;
+  authUserId: string;
+}): Promise<object> => {
+  const { orderId, sessionId, authUserId } = params;
+
+  // Linking rewrites which table pays for an order, so it is a modification
+  // path and carries the same cross-branch guard as a cancellation.
+  const order = await loadOrderContext(orderId);
+  const actor = await authorizeStaffForOrder(authUserId, order);
+
+  const { data: session, error: sessionError } = await supabaseAdmin
+    .from("table_sessions")
+    .select("id, branch_id, status")
+    .eq("id", sessionId)
+    .maybeSingle();
+
+  if (sessionError) {
+    throw createError(sessionError.message, 500, "SESSION_LOOKUP_FAILED");
+  }
+
+  if (!session) {
+    throw createError("Session not found", 404, "SESSION_NOT_FOUND");
+  }
+
+  const sessionRow = session as Record<string, unknown>;
+
+  if ((sessionRow["branch_id"] as string) !== order.branch_id) {
+    throw createError("That session belongs to a different branch", 403, "WRONG_BRANCH");
+  }
+
+  if ((sessionRow["status"] as string) !== "active") {
+    throw createError("That session is not active", 400, "SESSION_NOT_ACTIVE");
+  }
+
+  // Moving a paid order into another session would hand it a clean balance and
+  // strip the already-paid protection from every later cancellation check.
+  if (order.session_id && order.session_id !== sessionId && (await isOrderPaid(order))) {
+    throw createError(
+      "This order was already paid; it cannot be moved to another session",
+      403,
+      "ALREADY_PAID",
+    );
+  }
+
   const { data, error } = await supabaseAdmin
     .from("orders")
     .update({ session_id: sessionId, is_linked: true })
@@ -257,6 +311,17 @@ export const linkOrderToSession = async (
   if (error || !data) {
     throw createError(error?.message ?? "Failed to link order", 400, "LINK_FAILED");
   }
+
+  await recordCancellationAudit({
+    actor,
+    action: "link_order_to_session",
+    referenceType: "order",
+    referenceId: orderId,
+    order,
+    oldStatus: order.status,
+    newStatus: order.status,
+    extra: { from_session_id: order.session_id, to_session_id: sessionId },
+  });
 
   return data;
 };
@@ -290,27 +355,118 @@ export const getActiveOrders = async (branchId: string): Promise<object[]> => {
   return data ?? [];
 };
 
-export const updateItemStatus = async (
-  orderId: string,
-  itemId: string,
-  status: "in_preparation" | "ready" | "cancelled",
-): Promise<object> => {
-  const timestampField: Record<string, string> = {
-    in_preparation: "in_preparation_at",
-    ready: "ready_at",
-    cancelled: "cancelled_at",
-  };
+export const updateItemStatus = async (params: {
+  orderId: string;
+  itemId: string;
+  status: "in_preparation" | "ready" | "cancelled";
+  authUserId: string;
+}): Promise<object> => {
+  const { orderId, itemId, status, authUserId } = params;
 
-  const { data: item, error: itemError } = await supabaseAdmin
+  const order = await loadOrderContext(orderId);
+  const actor = await authorizeStaffForOrder(authUserId, order);
+
+  const { data: existing, error: existingError } = await supabaseAdmin
     .from("order_items")
-    .update({ status, [timestampField[status]]: new Date().toISOString() })
+    .select("id, status")
     .eq("id", itemId)
     .eq("order_id", orderId)
-    .select("*")
-    .single();
+    .maybeSingle();
 
-  if (itemError || !item) {
-    throw createError(itemError?.message ?? "Item not found", 404, "ITEM_NOT_FOUND");
+  if (existingError) {
+    throw createError(existingError.message, 500, "ITEM_LOOKUP_FAILED");
+  }
+
+  if (!existing) {
+    throw createError("Item not found", 404, "ITEM_NOT_FOUND");
+  }
+
+  const previousStatus = (existing as Record<string, unknown>)["status"] as string;
+  let paid = false;
+
+  // A cancelled item is terminal: without this any in-branch employee could
+  // resurrect it by setting it back to received / in_preparation / ready.
+  if (previousStatus === "cancelled") {
+    throw createError("This item is already cancelled", 400, "ITEM_ALREADY_CANCELLED");
+  }
+
+  // Forward-only. Downgrading a ready item back to in_preparation and then
+  // cancelling it would otherwise walk straight around the ready-item lock.
+  if (status !== "cancelled") {
+    const flow = ["received", "in_preparation", "ready"];
+    if (flow.indexOf(status) <= flow.indexOf(previousStatus)) {
+      throw createError(
+        `An item cannot go from ${previousStatus} back to ${status}`,
+        400,
+        "INVALID_STATUS_TRANSITION",
+      );
+    }
+  }
+
+  if (status === "cancelled") {
+    paid = (await isItemPaid(itemId, order.session_id)) || (await isOrderPaid(order));
+    assertCancellationAllowed({ order, actor, paid, itemStatuses: [previousStatus] });
+  }
+
+  // order_items carries a status and nothing else: there is no
+  // in_preparation_at / ready_at / cancelled_at column on it, so writing one
+  // made every single item status update fail.
+  // Compare-and-swap on the status that was authorized, so a concurrent
+  // transition loses the race instead of being silently overwritten.
+  const { data: updatedItems, error: itemError } = await supabaseAdmin
+    .from("order_items")
+    .update({ status })
+    .eq("id", itemId)
+    .eq("order_id", orderId)
+    .eq("status", previousStatus)
+    .select("*");
+
+  if (itemError) {
+    throw createError(itemError.message, 500, "ITEM_UPDATE_FAILED");
+  }
+
+  const item = (updatedItems ?? [])[0];
+
+  if (!item) {
+    throw createError(
+      "This item changed state while it was being updated",
+      403,
+      "STATUS_LOCKED",
+    );
+  }
+
+  if (status === "cancelled") {
+    await recordCancellationAudit({
+      actor,
+      action: "cancel_order_item",
+      referenceType: "order_item",
+      referenceId: itemId,
+      order,
+      oldStatus: previousStatus,
+      newStatus: "cancelled",
+      paid,
+      extra: { via: "item_status_update" },
+    });
+  }
+
+  // Keep the parent in step with the kitchen: an order whose items are being
+  // prepared must not stay 'received', or its owner could still cancel it
+  // outright instead of going through the waiter.
+  if (status === "in_preparation") {
+    const { error: parentError } = await supabaseAdmin
+      .from("orders")
+      .update({ status: "in_preparation", in_preparation_at: new Date().toISOString() })
+      .eq("id", orderId)
+      .eq("status", "received");
+
+    if (parentError) {
+      // Not fatal - the item did move - but it leaves the order looking
+      // cancellable-on-the-spot, so it must be visible.
+      logger.error(
+        { err: parentError, order_id: orderId },
+        "item moved to in_preparation but the parent order could not follow",
+      );
+    }
   }
 
   const { data: allItems } = await supabaseAdmin
@@ -319,9 +475,13 @@ export const updateItemStatus = async (
     .eq("order_id", orderId)
     .neq("status", "cancelled");
 
-  const allReady = (allItems ?? []).every(
-    (i: Record<string, unknown>) => i["status"] === "ready",
-  );
+  const liveItems = allItems ?? [];
+
+  // An empty list must NOT count as "all ready": cancelling the last item would
+  // otherwise flip the whole order to ready.
+  const allReady =
+    liveItems.length > 0 &&
+    liveItems.every((i: Record<string, unknown>) => i["status"] === "ready");
 
   if (allReady) {
     await supabaseAdmin
@@ -333,30 +493,63 @@ export const updateItemStatus = async (
   return item;
 };
 
-export const updateOrderStatus = async (
-  orderId: string,
-  status: "ready" | "delivered",
-): Promise<object> => {
-  const timestampField: Record<string, string> = {
-    ready: "ready_at",
-    delivered: "delivered_at",
-  };
+export const updateOrderStatus = async (params: {
+  orderId: string;
+  status: "ready" | "delivered";
+  authUserId: string;
+}): Promise<object> => {
+  const { orderId, status, authUserId } = params;
 
-  await supabaseAdmin
-    .from("order_items")
-    .update({ status, [timestampField[status]]: new Date().toISOString() })
-    .eq("order_id", orderId)
-    .neq("status", "cancelled");
+  const order = await loadOrderContext(orderId);
+  await authorizeStaffForOrder(authUserId, order);
 
-  const { data, error } = await supabaseAdmin
+  if (order.status === "cancelled") {
+    throw createError("This order is already cancelled", 400, "ALREADY_CANCELLED");
+  }
+
+  // Forward-only: a delivered order must not be walked back to ready.
+  const orderFlow = ["received", "in_preparation", "ready", "delivered"];
+  if (orderFlow.indexOf(status) <= orderFlow.indexOf(order.status)) {
+    throw createError(
+      `An order cannot go from ${order.status} back to ${status}`,
+      400,
+      "INVALID_STATUS_TRANSITION",
+    );
+  }
+
+  // order_items has no 'delivered' state (its CHECK allows received /
+  // in_preparation / ready / cancelled) and no timestamp columns, so only the
+  // 'ready' mirror is written, and only the status itself.
+  if (status === "ready") {
+    await supabaseAdmin
+      .from("order_items")
+      .update({ status: "ready" })
+      .eq("order_id", orderId)
+      .neq("status", "cancelled");
+  }
+
+  const orderPatch: Record<string, unknown> = { status };
+  orderPatch[status === "ready" ? "ready_at" : "delivered_at"] = new Date().toISOString();
+
+  const { data: updated, error } = await supabaseAdmin
     .from("orders")
-    .update({ status, [timestampField[status]]: new Date().toISOString() })
+    .update(orderPatch)
     .eq("id", orderId)
-    .select("*")
-    .single();
+    .eq("status", order.status)
+    .select("*");
 
-  if (error || !data) {
-    throw createError(error?.message ?? "Order not found", 404, "ORDER_NOT_FOUND");
+  if (error) {
+    throw createError(error.message, 500, "ORDER_UPDATE_FAILED");
+  }
+
+  const data = (updated ?? [])[0];
+
+  if (!data) {
+    throw createError(
+      "This order changed state while it was being updated",
+      403,
+      "STATUS_LOCKED",
+    );
   }
 
   return data;
@@ -370,45 +563,50 @@ export const cancelOrder = async (params: {
 }): Promise<object> => {
   const { orderId, reason, item_id, userId } = params;
 
-  const { data: order, error: orderError } = await supabaseAdmin
-    .from("orders")
-    .select("id, status, session_id")
-    .eq("id", orderId)
-    .single();
+  // Load the order and authorize the caller against ITS branch before touching
+  // anything. This is the guard whose absence let any authenticated user cancel
+  // any order in the platform.
+  const order = await loadOrderContext(orderId);
+  const actor = await resolveCancellationActor(userId, order);
 
-  if (orderError || !order) {
-    throw createError("Order not found", 404, "ORDER_NOT_FOUND");
+  if (item_id) {
+    const { data: item, error: itemError } = await supabaseAdmin
+      .from("order_items")
+      .select("id, status")
+      .eq("id", item_id)
+      .eq("order_id", orderId)
+      .maybeSingle();
+
+    if (itemError) {
+      throw createError(itemError.message, 500, "ITEM_LOOKUP_FAILED");
+    }
+
+    if (!item) {
+      throw createError("Item not found on this order", 404, "ITEM_NOT_FOUND");
+    }
   }
 
-  const status = (order as Record<string, unknown>)["status"] as string;
+  // Cancelling the order cancels every live item, so each of them has to be
+  // cancellable - a plate already at the pass locks the whole action.
+  const itemStatuses = await targetItemStatuses(orderId, item_id ?? null);
 
-  if (status === "ready" || status === "delivered") {
-    throw createError("Cannot cancel completed orders", 400, "CANNOT_CANCEL");
-  }
+  const paid = item_id
+    ? (await isItemPaid(item_id, order.session_id)) || (await isOrderPaid(order))
+    : await isOrderPaid(order);
 
-  if (status === "in_preparation") {
-    const sessionId = (order as Record<string, unknown>)["session_id"] as string | null;
+  const mode = assertCancellationAllowed({ order, actor, paid, itemStatuses });
 
-    // Anticipatory and pickup orders are created without a session, so there is
-    // no session_participants row to point at. requested_by_participant is
-    // nullable, so those orders can still raise a request - it simply carries no
-    // participant reference.
-    const requestedByParticipant = sessionId
-      ? await resolveParticipantId(sessionId, userId)
-      : null;
-
+  if (mode === "request") {
     const { data: request, error: reqError } = await supabaseAdmin
       .from("cancellation_requests")
       .insert({
         order_id: orderId,
         // Real columns are order_item_id (FK order_items.id) and
-        // requested_by_participant (FK session_participants.id) - the insert
-        // used to write `item_id` and `requested_by` with an auth id, neither
-        // of which exists. request_type is REQUIRED and was never written; its
-        // CHECK allows only 'cancellation' | 'modification'.
+        // requested_by_participant (FK session_participants.id). request_type is
+        // REQUIRED and its CHECK allows only 'cancellation' | 'modification'.
         order_item_id: item_id ?? null,
         request_type: "cancellation",
-        requested_by_participant: requestedByParticipant,
+        requested_by_participant: actor.kind === "client" ? actor.participantId : null,
         reason: reason ?? null,
         status: "pending",
         created_at: new Date().toISOString(),
@@ -417,38 +615,161 @@ export const cancelOrder = async (params: {
       .single();
 
     if (reqError || !request) {
-      throw createError(reqError?.message ?? "Failed to create cancellation request", 500, "REQUEST_FAILED");
+      throw createError(
+        reqError?.message ?? "Failed to create cancellation request",
+        500,
+        "REQUEST_FAILED",
+      );
     }
+
+    const requestId = (request as Record<string, unknown>)["id"] as string;
+
+    const audited = await recordCancellationAudit({
+      actor,
+      action: "request_cancellation",
+      referenceType: "cancellation_request",
+      referenceId: requestId,
+      order,
+      oldStatus: order.status,
+      newStatus: "pending",
+      reason: reason ?? null,
+      paid,
+      extra: { order_item_id: item_id ?? null },
+    });
 
     return {
       message: "Your waiter will come to confirm",
-      request_id: (request as Record<string, unknown>)["id"],
+      request_id: requestId,
+      audit_logged: audited,
     };
   }
 
-  if (item_id) {
-    await supabaseAdmin
-      .from("order_items")
-      // order_items has no cancelled_at column (orders does) - including it
-      // made every item cancellation fail silently.
-      .update({ status: "cancelled" })
-      .eq("id", item_id)
-      .eq("order_id", orderId);
-  } else {
-    await supabaseAdmin
-      .from("order_items")
-      // order_items has no cancelled_at column (orders does) - including it
-      // made every item cancellation fail silently.
-      .update({ status: "cancelled" })
-      .eq("order_id", orderId);
+  const audited = await cancelNow({ order, actor, itemId: item_id ?? null, reason: reason ?? null, paid });
 
-    await supabaseAdmin
-      .from("orders")
-      .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
-      .eq("id", orderId);
+  return { success: true, audit_logged: audited };
+};
+
+/**
+ * Perform an authorized cancellation and audit it. Callers MUST have run
+ * `assertCancellationAllowed` first - this helper does no authorization.
+ */
+const cancelNow = async (params: {
+  order: OrderContext;
+  actor: CancellationActor;
+  itemId: string | null;
+  reason: string | null;
+  paid: boolean;
+}): Promise<boolean> => {
+  const { order, actor, itemId, reason, paid } = params;
+
+  if (itemId) {
+    // The status filter makes a concurrent transition lose the race instead of
+    // being silently overwritten between the check and the write.
+    const { data: cancelledItem, error } = await supabaseAdmin
+      // order_items has no cancelled_at column (orders does).
+      .from("order_items")
+      .update({ status: "cancelled" })
+      .eq("id", itemId)
+      .eq("order_id", order.id)
+      .in("status", ["received", "in_preparation"])
+      .select("id");
+
+    if (error) {
+      throw createError(error.message, 500, "CANCEL_FAILED");
+    }
+
+    if ((cancelledItem ?? []).length === 0) {
+      throw createError(
+        "This item changed state while it was being cancelled",
+        403,
+        "STATUS_LOCKED",
+      );
+    }
+
+    return recordCancellationAudit({
+      actor,
+      action: "cancel_order_item",
+      referenceType: "order_item",
+      referenceId: itemId,
+      order,
+      oldStatus: order.status,
+      newStatus: "cancelled",
+      reason,
+      paid,
+    });
   }
 
-  return { success: true };
+  // The order is cancelled FIRST, and only if it is still in the state that was
+  // authorized. Everything reads the order's status, so a half-applied
+  // cancellation must never leave dead items under a live order.
+  const { data: cancelledOrder, error: orderError } = await supabaseAdmin
+    .from("orders")
+    .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
+    .eq("id", order.id)
+    .eq("status", order.status)
+    .select("id");
+
+  if (orderError) {
+    throw createError(orderError.message, 500, "CANCEL_FAILED");
+  }
+
+  if ((cancelledOrder ?? []).length === 0) {
+    throw createError(
+      "This order changed state while it was being cancelled",
+      403,
+      "STATUS_LOCKED",
+    );
+  }
+
+  const { error: itemsError } = await supabaseAdmin
+    .from("order_items")
+    .update({ status: "cancelled" })
+    .eq("order_id", order.id)
+    .neq("status", "cancelled");
+
+  if (itemsError) {
+    // Put the order back the way it was rather than leaving it cancelled with
+    // live items underneath: without a transaction this rollback is what makes
+    // the whole action retryable.
+    const { error: rollbackError } = await supabaseAdmin
+      .from("orders")
+      .update({ status: order.status, cancelled_at: null })
+      .eq("id", order.id)
+      .eq("status", "cancelled");
+
+    if (rollbackError) {
+      logger.error(
+        { err: rollbackError, order_id: order.id, original_status: order.status },
+        "order was cancelled but its items were not, and the rollback failed",
+      );
+    }
+
+    throw createError(itemsError.message, 500, "CANCEL_FAILED");
+  }
+
+  return recordCancellationAudit({
+    actor,
+    action: "cancel_order",
+    referenceType: "order",
+    referenceId: order.id,
+    order,
+    oldStatus: order.status,
+    newStatus: "cancelled",
+    reason,
+    paid,
+  });
+};
+
+/** Statuses of the items an action would cancel: one item, or every live item. */
+const targetItemStatuses = async (orderId: string, itemId: string | null): Promise<string[]> => {
+  const base = supabaseAdmin.from("order_items").select("status").eq("order_id", orderId);
+  const { data, error } = itemId ? await base.eq("id", itemId) : await base.neq("status", "cancelled");
+
+  if (error) {
+    throw createError(error.message, 500, "ITEM_LOOKUP_FAILED");
+  }
+
+  return (data ?? []).map((i) => (i as Record<string, unknown>)["status"] as string);
 };
 
 export const handleCancellationRequest = async (params: {
@@ -463,54 +784,123 @@ export const handleCancellationRequest = async (params: {
     .from("cancellation_requests")
     .select("*")
     .eq("id", requestId)
-    .single();
+    .maybeSingle();
 
-  if (reqError || !request) {
+  if (reqError) {
+    throw createError(reqError.message, 500, "REQUEST_LOOKUP_FAILED");
+  }
+
+  if (!request) {
     throw createError("Cancellation request not found", 404, "REQUEST_NOT_FOUND");
   }
 
-  const { data, error } = await supabaseAdmin
+  const requestRow = request as Record<string, unknown>;
+  const previousStatus = requestRow["status"] as string;
+
+  if (previousStatus !== "pending") {
+    throw createError(
+      "This cancellation request was already resolved",
+      400,
+      "REQUEST_ALREADY_RESOLVED",
+    );
+  }
+
+  // Resolve the request against the branch of ITS order, so a waiter from
+  // another branch cannot approve cancellations that are not theirs.
+  const order = await loadOrderContext(requestRow["order_id"] as string);
+  const actor = await authorizeStaffForOrder(employeeId, order);
+  const itemId = (requestRow["order_item_id"] as string | null) ?? null;
+
+  const paid = itemId
+    ? (await isItemPaid(itemId, order.session_id)) || (await isOrderPaid(order))
+    : await isOrderPaid(order);
+
+  if (status === "approved") {
+    // Approving performs the cancellation, so it must satisfy every rule,
+    // including the current state of the items it would cancel.
+    assertCancellationAllowed({
+      order,
+      actor,
+      paid,
+      itemStatuses: await targetItemStatuses(order.id, itemId),
+    });
+  } else {
+    assertCancellationRole(actor);
+  }
+
+  const { data: resolved, error } = await supabaseAdmin
     .from("cancellation_requests")
     .update({
       status,
       rejection_reason: rejection_reason ?? null,
       // cancellation_requests.resolved_by identifies staff by employees.id.
-      resolved_by: await resolveEmployeeId(employeeId),
+      resolved_by: actor.employeeId,
       resolved_at: new Date().toISOString(),
     })
     .eq("id", requestId)
-    .select("*")
-    .single();
+    // Claim the request only while it is still pending, so two waiters
+    // resolving at the same time cannot both win.
+    .eq("status", "pending")
+    .select("*");
 
-  if (error || !data) {
-    throw createError(error?.message ?? "Update failed", 500, "UPDATE_FAILED");
+  if (error) {
+    throw createError(error.message, 500, "UPDATE_FAILED");
   }
 
+  const data = (resolved ?? [])[0];
+
+  if (!data) {
+    throw createError(
+      "This cancellation request was already resolved",
+      400,
+      "REQUEST_ALREADY_RESOLVED",
+    );
+  }
+
+  let audited = await recordCancellationAudit({
+    actor,
+    action: "resolve_cancellation_request",
+    referenceType: "cancellation_request",
+    referenceId: requestId,
+    order,
+    oldStatus: previousStatus,
+    newStatus: status,
+    reason: (requestRow["reason"] as string | null) ?? null,
+    paid,
+    extra: {
+      resolution: status,
+      rejection_reason: rejection_reason ?? null,
+      order_item_id: itemId,
+    },
+  });
+
   if (status === "approved") {
-    const orderId = (request as Record<string, unknown>)["order_id"] as string;
-    const itemId = (request as Record<string, unknown>)["order_item_id"] as string | null;
+    try {
+      const cancelAudited = await cancelNow({
+        order,
+        actor,
+        itemId,
+        reason: (requestRow["reason"] as string | null) ?? null,
+        paid,
+      });
+      audited = audited && cancelAudited;
+    } catch (err) {
+      // The request must never stay 'approved' with nothing cancelled behind it.
+      const { error: rollbackError } = await supabaseAdmin
+        .from("cancellation_requests")
+        .update({ status: "pending", resolved_by: null, resolved_at: null })
+        .eq("id", requestId);
 
-    if (itemId) {
-      await supabaseAdmin
-        .from("order_items")
-        // order_items has no cancelled_at column (orders does) - including it
-        // made every item cancellation fail silently.
-        .update({ status: "cancelled" })
-        .eq("id", itemId);
-    } else {
-      await supabaseAdmin
-        .from("order_items")
-        // order_items has no cancelled_at column (orders does) - including it
-        // made every item cancellation fail silently.
-        .update({ status: "cancelled" })
-        .eq("order_id", orderId);
+      if (rollbackError) {
+        logger.error(
+          { err: rollbackError, request_id: requestId },
+          "cancellation request stayed resolved but the cancellation failed",
+        );
+      }
 
-      await supabaseAdmin
-        .from("orders")
-        .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
-        .eq("id", orderId);
+      throw err;
     }
   }
 
-  return data;
+  return { ...(data as Record<string, unknown>), audit_logged: audited };
 };

@@ -108,7 +108,11 @@ export const linkOrder = async (
       return next(createError("session_id is required", 400, "MISSING_FIELDS"));
     }
 
-    const result = await ordersService.linkOrderToSession(orderId, session_id);
+    const result = await ordersService.linkOrderToSession({
+      orderId,
+      sessionId: session_id,
+      authUserId: req.user!.id,
+    });
     res.json({ data: result });
   } catch (err) {
     next(err);
@@ -156,7 +160,12 @@ export const updateItemStatus = async (
       return next(createError("status must be 'in_preparation', 'ready', or 'cancelled'", 400, "INVALID_STATUS"));
     }
 
-    const result = await ordersService.updateItemStatus(orderId, itemId, status);
+    const result = await ordersService.updateItemStatus({
+      orderId,
+      itemId,
+      status,
+      authUserId: req.user!.id,
+    });
     res.json({ data: result });
   } catch (err) {
     next(err);
@@ -176,7 +185,11 @@ export const updateOrderStatus = async (
       return next(createError("status must be 'ready' or 'delivered'", 400, "INVALID_STATUS"));
     }
 
-    const result = await ordersService.updateOrderStatus(orderId, status);
+    const result = await ordersService.updateOrderStatus({
+      orderId,
+      status,
+      authUserId: req.user!.id,
+    });
     res.json({ data: result });
   } catch (err) {
     next(err);
