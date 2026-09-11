@@ -10,7 +10,7 @@ const router: IRouter = Router();
 router.post("/join", optionalAuthenticate, sessionsController.joinSession);
 router.post("/scan", optionalAuthenticate, sessionsController.scanAndJoin);
 router.get("/:sessionId", authenticate, sessionsController.getSession);
-router.get("/:sessionId/participants", sessionsController.getParticipants);
+router.get("/:sessionId/participants", authenticate, sessionsController.getParticipants);
 router.post("/:sessionId/close", authenticate, requireEmployee, sessionsController.closeSession);
 router.post("/:sessionId/call-waiter", optionalAuthenticate, waiterCallsController.callWaiter);
 router.get("/:sessionId/payments", paymentsController.getSessionPayments);

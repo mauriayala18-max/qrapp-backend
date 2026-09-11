@@ -633,17 +633,76 @@ export const getSession = async (sessionId: string): Promise<object> => {
   return session;
 };
 
-export const getParticipants = async (sessionId: string): Promise<object[]> => {
+/**
+ * The list of diners currently at a table.
+ *
+ * Only ACTIVE participants (disconnected_at IS NULL) are returned - someone
+ * who already left is not "at the table" for staff or fellow diners looking at
+ * the roster. Authorization is the caller's job (see session-participants-access.ts);
+ * this function assumes it has already run.
+ */
+export const getParticipants = async (
+  sessionId: string,
+): Promise<{
+  session_id: string;
+  total: number;
+  participants: Array<{
+    participant_id: string;
+    display_name: string;
+    is_registered_user: boolean;
+    connection_method: string | null;
+    joined_at: string | null;
+  }>;
+}> => {
   const { data, error } = await supabaseAdmin
     .from("session_participants")
-    .select("*")
-    .eq("session_id", sessionId);
+    .select("id, user_id, web_name, connection_method, joined_at")
+    .eq("session_id", sessionId)
+    .is("disconnected_at", null);
 
   if (error) {
     throw createError(error.message, 500, "FETCH_FAILED");
   }
 
-  return data ?? [];
+  const rows = (data ?? []) as Array<Record<string, unknown>>;
+  const userIds = [...new Set(rows.map((r) => r["user_id"] as string | null).filter((id): id is string => Boolean(id)))];
+
+  const namesByUserId = new Map<string, string>();
+  if (userIds.length > 0) {
+    const { data: users, error: usersError } = await supabaseAdmin
+      .from("users")
+      .select("id, full_name")
+      .in("id", userIds);
+
+    if (usersError) {
+      throw createError(usersError.message, 500, "USER_LOOKUP_FAILED");
+    }
+
+    for (const u of (users ?? []) as Array<Record<string, unknown>>) {
+      const fullName = u["full_name"] as string | null;
+      if (fullName) namesByUserId.set(u["id"] as string, fullName);
+    }
+  }
+
+  const participants = rows.map((row) => {
+    const userId = row["user_id"] as string | null;
+    const webName = row["web_name"] as string | null;
+    const displayName = (userId ? namesByUserId.get(userId) : null) ?? webName ?? "Invitado";
+
+    return {
+      participant_id: row["id"] as string,
+      display_name: displayName,
+      is_registered_user: Boolean(userId),
+      connection_method: (row["connection_method"] as string | null) ?? null,
+      joined_at: (row["joined_at"] as string | null) ?? null,
+    };
+  });
+
+  return {
+    session_id: sessionId,
+    total: participants.length,
+    participants,
+  };
 };
 
 /**

@@ -1,6 +1,7 @@
 import { type Request, type Response, type NextFunction } from "express";
 import * as sessionsService from "./sessions.service.js";
 import { createError } from "../../middleware/errorHandler.js";
+import { authorizeParticipantsAccess, loadSessionForRoster } from "./session-participants-access.js";
 
 export const joinSession = async (
   req: Request,
@@ -87,6 +88,8 @@ export const getParticipants = async (
 ): Promise<void> => {
   try {
     const { sessionId } = req.params as { sessionId: string };
+    const session = await loadSessionForRoster(sessionId);
+    await authorizeParticipantsAccess(req.user!.id, session);
     const result = await sessionsService.getParticipants(sessionId);
     res.json({ data: result });
   } catch (err) {
