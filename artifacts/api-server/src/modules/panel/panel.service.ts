@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { generateSessionToken, generateUniquePin } from "../../lib/session-credentials.js";
+import { tableStickerPath, withStickerUrl } from "../../lib/public-url.js";
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
@@ -735,7 +737,9 @@ export const getTables = async (branchId: string): Promise<object[]> => {
     throw createError(error.message, 500, "FETCH_FAILED");
   }
 
-  return (data ?? []) as object[];
+  // qr_code_url is the stored permanent path; qr_sticker_url is what actually
+  // goes on the printed sticker, and it is null until PUBLIC_APP_URL is set.
+  return ((data ?? []) as Array<{ id: string }>).map(withStickerUrl);
 };
 
 export const createTable = async (params: {
@@ -747,15 +751,19 @@ export const createTable = async (params: {
 
   const token = generateSessionToken();
   const pin = await generateUniquePin();
-  const qrCodeUrl = `/t/${branchId}/${token}`;
+
+  // The id is minted here so the permanent sticker path can be written in the
+  // same insert. It never changes again - not on close, not on rotation.
+  const tableId = randomUUID();
 
   const { data, error } = await supabaseAdmin
     .from("tables")
     .insert({
+      id: tableId,
       branch_id: branchId,
       table_number,
       capacity: capacity ?? null,
-      qr_code_url: qrCodeUrl,
+      qr_code_url: tableStickerPath(tableId),
       // The real columns are current_session_token / current_pin; `token` and
       // `pin` do not exist, so creating a table failed outright.
       current_session_token: token,
@@ -770,7 +778,7 @@ export const createTable = async (params: {
     throw createError(error?.message ?? "Failed to create table", 500, "CREATE_FAILED");
   }
 
-  return data;
+  return withStickerUrl(data as { id: string });
 };
 
 export const updateTable = async (params: {

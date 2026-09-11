@@ -97,38 +97,26 @@ const openSessionForTable = async (
 };
 
 /**
- * Give a freed table a brand new token and PIN, so nothing printed, screenshotted
- * or remembered from the previous party can reach the next one.
+ * Give a freed table a brand new token and PIN, so nothing screenshotted or
+ * remembered from the previous party can reach the next one.
  *
- * The stored qr_code_url embeds the token, so it is rewritten in the same
- * update - otherwise the panel would keep handing out a dead link. Retried
+ * qr_code_url is deliberately NOT touched: the sticker on the table encodes a
+ * permanent /t/{table_id} link and the server resolves the live session behind
+ * it. Rotating that URL would kill printed stickers on every close. Retried
  * once, because a table left holding closed-session credentials is worse than
  * a slow close.
  */
 const rotateTableCredentials = async (tableId: string, sessionId: string): Promise<void> => {
-  const { data: tableRow } = await supabaseAdmin
-    .from("tables")
-    .select("branch_id, qr_code_url")
-    .eq("id", tableId)
-    .maybeSingle();
-
-  const branchId = (tableRow as Record<string, unknown> | null)?.["branch_id"] as string | undefined;
-  const currentUrl = (tableRow as Record<string, unknown> | null)?.["qr_code_url"] as string | undefined;
-
   let lastMessage = "Failed to rotate table credentials";
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    const token = generateSessionToken();
-    const patch: Record<string, unknown> = {
-      current_session_token: token,
-      current_pin: await generateUniquePin(),
-    };
-
-    if (branchId && currentUrl?.startsWith("/t/")) {
-      patch["qr_code_url"] = `/t/${branchId}/${token}`;
-    }
-
-    const { error } = await supabaseAdmin.from("tables").update(patch).eq("id", tableId);
+    const { error } = await supabaseAdmin
+      .from("tables")
+      .update({
+        current_session_token: generateSessionToken(),
+        current_pin: await generateUniquePin(),
+      })
+      .eq("id", tableId);
 
     if (!error) return;
     lastMessage = error.message;
@@ -162,6 +150,103 @@ const isLiveSessionForTable = async (
 
   const groupSession = await resolveGroupSession(table);
   return groupSession?.["id"] === sessionId;
+};
+
+/**
+ * Seat a diner at a table: enforce the branch's entry rules, find or open the
+ * table's session, and add the diner to it exactly once.
+ *
+ * Every entry point funnels through here - PIN, permanent QR sticker, and the
+ * legacy token scan - so the rules cannot drift apart between them.
+ */
+const enterTableSession = async (params: {
+  table: Record<string, unknown>;
+  method: JoinMethod;
+  platform: "app" | "web";
+  userId?: string;
+  name?: string;
+  knownSession?: Record<string, unknown> | null;
+}): Promise<{
+  session: Record<string, unknown>;
+  participant: Record<string, unknown>;
+  participants: Array<Record<string, unknown>>;
+  openedNow: boolean;
+  confirmation: Record<string, unknown>;
+}> => {
+  const { table, method, platform, userId, name, knownSession } = params;
+
+  const branch = table["branches"] as Record<string, unknown> | null;
+
+  // The restaurant decides whether diners come in by QR, by PIN, or either.
+  assertAccessMethodAllows(resolveAccessMethod(branch), method);
+
+  // Grouped tables share the group's session.
+  let session = knownSession ?? (await resolveGroupSession(table));
+  let openedNow = false;
+
+  if (!session) {
+    const { data: existingSession } = await supabaseAdmin
+      .from("table_sessions")
+      .select("*")
+      .eq("table_id", table["id"] as string)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (existingSession) {
+      session = existingSession as Record<string, unknown>;
+    } else {
+      // An empty table opens its session on the first diner, adopting the
+      // credentials the table already carries.
+      session = await openSessionForTable(table);
+      openedNow = true;
+    }
+  }
+
+  const sessionId = session["id"] as string;
+  const existingParticipant = await findParticipant(sessionId, userId, name);
+
+  // Staff can seal a table; the diners already inside keep their access. A
+  // guest's typed name is not proof of being one of them, so only an
+  // authenticated diner can be readmitted to a locked table.
+  assertEntryAllowed(session, Boolean(existingParticipant && userId));
+
+  const participant = await upsertParticipant({
+    sessionId,
+    method,
+    platform,
+    userId,
+    name,
+    existing: existingParticipant,
+  });
+
+  const { data: participantRows } = await supabaseAdmin
+    .from("session_participants")
+    .select("*")
+    .eq("session_id", sessionId);
+
+  const participants = (participantRows ?? []) as Array<Record<string, unknown>>;
+  const restaurant = branch?.["restaurants"] as Record<string, unknown> | null;
+
+  return {
+    session,
+    participant,
+    participants,
+    openedNow,
+    confirmation: {
+      session_id: sessionId,
+      session_opened_now: openedNow,
+      joined_via: method,
+      rejoined: Boolean(existingParticipant),
+      table_id: table["id"],
+      table_number: table["table_number"] ?? null,
+      branch: branch
+        ? { id: branch["id"], name: branch["name"], address: branch["address"] }
+        : null,
+      restaurant_name: restaurant?.["name"] ?? null,
+      participant_id: participant["id"],
+      participants,
+    },
+  };
 };
 
 /**
@@ -390,70 +475,56 @@ export const joinSession = async (params: {
     throw createError("Invalid token or PIN", 404, "TABLE_NOT_FOUND");
   }
 
-  const branch = table["branches"] as Record<string, unknown> | null;
-
-  // The restaurant decides whether diners come in by QR, by PIN, or either.
-  assertAccessMethodAllows(resolveAccessMethod(branch), method);
-
-  // Grouped tables share the group's session.
-  let session = credentialSession ?? (await resolveGroupSession(table));
-  let openedNow = false;
-
-  if (!session) {
-    const { data: existingSession } = await supabaseAdmin
-      .from("table_sessions")
-      .select("*")
-      .eq("table_id", table["id"] as string)
-      .eq("status", "active")
-      .maybeSingle();
-
-    if (existingSession) {
-      session = existingSession as Record<string, unknown>;
-    } else {
-      // The fix: an empty table opens its session on the first diner, using
-      // the credentials already printed on the table.
-      session = await openSessionForTable(table);
-      openedNow = true;
-    }
-  }
-
-  const sessionId = session["id"] as string;
-  const existingParticipant = await findParticipant(sessionId, userId, name);
-
-  // Staff can seal a table; the diners already inside keep their access. A
-  // guest's typed name is not proof of being one of them, so only an
-  // authenticated diner can be readmitted to a locked table.
-  assertEntryAllowed(session, Boolean(existingParticipant && userId));
-
-  const participant = await upsertParticipant({
-    sessionId,
+  const { confirmation } = await enterTableSession({
+    table,
     method,
     platform,
     userId,
     name,
-    existing: existingParticipant,
+    knownSession: credentialSession,
   });
 
-  const { data: participants } = await supabaseAdmin
-    .from("session_participants")
-    .select("*")
-    .eq("session_id", sessionId);
+  return confirmation;
+};
 
-  const restaurant = branch?.["restaurants"] as Record<string, unknown> | null;
+/**
+ * Scan of the permanent QR sticker: the URL carries only the table id, and the
+ * server resolves whatever session that table is running right now - or opens
+ * one if the table is free. No PIN prompt: QR and PIN are two doors into the
+ * same session, and the camera is the fast one.
+ */
+export const scanTable = async (params: {
+  tableId: string;
+  platform: "app" | "web";
+  name?: string;
+  userId?: string;
+}): Promise<object> => {
+  const { tableId, platform, name, userId } = params;
 
-  return {
-    session_id: sessionId,
-    session_opened_now: openedNow,
-    joined_via: method,
-    rejoined: Boolean(existingParticipant),
-    table_number: table["table_number"] ?? null,
-    branch: branch
-      ? { id: branch["id"], name: branch["name"], address: branch["address"] }
-      : null,
-    restaurant_name: restaurant?.["name"] ?? null,
-    participant_id: participant["id"],
-    participants: participants ?? [],
-  };
+  if (!userId && !name) {
+    throw createError("name is required for guest users", 400, "MISSING_FIELDS");
+  }
+
+  const { data: table, error } = await supabaseAdmin
+    .from("tables")
+    .select("*, branches(*, restaurants(*))")
+    .eq("id", tableId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (error || !table) {
+    throw createError("Table not found", 404, "TABLE_NOT_FOUND");
+  }
+
+  const { confirmation } = await enterTableSession({
+    table: table as Record<string, unknown>,
+    method: "qr",
+    platform,
+    userId,
+    name,
+  });
+
+  return confirmation;
 };
 
 export const scanAndJoin = async (params: {
@@ -478,55 +549,25 @@ export const scanAndJoin = async (params: {
     throw createError("name is required for guest users", 400, "MISSING_FIELDS");
   }
 
-  const scanBranch = (table as Record<string, unknown>)["branches"] as Record<string, unknown> | null;
-
-  // Scanning is the QR path, so a PIN-only branch must refuse it here too.
-  assertAccessMethodAllows(resolveAccessMethod(scanBranch), "qr");
-
-  // Grouped tables share the group's session
-  let session = await resolveGroupSession(table as Record<string, unknown>);
-
-  if (!session) {
-    const { data: existingSession } = await supabaseAdmin
-      .from("table_sessions")
-      .select("*")
-      .eq("table_id", table.id)
-      .eq("status", "active")
-      .maybeSingle();
-
-    if (existingSession) {
-      session = existingSession;
-    } else {
-      session = await openSessionForTable(table as Record<string, unknown>);
-    }
-  }
-
-  const activeSession = session as { id: string; status: string };
-
-  const existingParticipant = await findParticipant(activeSession.id, userId, name);
-
-  assertEntryAllowed(session as Record<string, unknown>, Boolean(existingParticipant && userId));
-
-  await upsertParticipant({
-    sessionId: activeSession.id,
+  const { session: enteredSession, participants: sessionParticipants } = await enterTableSession({
+    table: table as Record<string, unknown>,
     method: "qr",
     platform,
     userId,
     name,
-    existing: existingParticipant,
   });
+
+  const activeSession = enteredSession as unknown as { id: string; status: string };
 
   const branch = (table as Record<string, unknown>)["branches"] as Record<string, unknown> | null;
   const restaurant = branch?.["restaurants"] as Record<string, unknown> | null;
   const branchId = branch?.["id"] as string | undefined;
 
   const [
-    { data: participants },
     { data: orders },
     { data: categories },
     { data: promotions },
   ] = await Promise.all([
-    supabaseAdmin.from("session_participants").select("*").eq("session_id", activeSession.id),
     supabaseAdmin
       .from("orders")
       .select("*, order_items(*, order_item_modifications(*))")
@@ -572,7 +613,7 @@ export const scanAndJoin = async (params: {
     },
     menu: categories ?? [],
     orders: orders ?? [],
-    participants: participants ?? [],
+    participants: sessionParticipants,
     promotions: promotions ?? [],
     banking_benefits: bankingBenefits,
   };
