@@ -11,6 +11,7 @@ import {
   resolveAccessMethod,
   type JoinMethod,
 } from "./session-access.js";
+import { assertNotExpelled } from "../expulsions/expulsion-guard.js";
 
 /**
  * Lazily open a session for a table that is currently free. A freed table has
@@ -203,6 +204,12 @@ const enterTableSession = async (params: {
   }
 
   const sessionId = session["id"] as string;
+
+  // A diner who was expelled from THIS session does not get back in, by QR or
+  // by PIN. Checked before the participant row is touched, because rejoining
+  // would otherwise just revive it.
+  await assertNotExpelled({ sessionId, userId, webName: name });
+
   const existingParticipant = await findParticipant(sessionId, userId, name);
 
   // Staff can seal a table; the diners already inside keep their access. A
@@ -218,6 +225,21 @@ const enterTableSession = async (params: {
     name,
     existing: existingParticipant,
   });
+
+  // Checked again, now that the seat exists. An expulsion that landed between
+  // the first check and this write would otherwise be undone by the revived
+  // participant row, so the seat is taken away again before answering.
+  try {
+    await assertNotExpelled({ sessionId, userId, webName: name });
+  } catch (err) {
+    await supabaseAdmin
+      .from("session_participants")
+      .update({ disconnected_at: new Date().toISOString() })
+      .eq("id", participant["id"] as string)
+      .is("disconnected_at", null);
+
+    throw err;
+  }
 
   const { data: participantRows } = await supabaseAdmin
     .from("session_participants")
@@ -638,7 +660,7 @@ export const getSession = async (sessionId: string): Promise<object> => {
  *
  * Only ACTIVE participants (disconnected_at IS NULL) are returned - someone
  * who already left is not "at the table" for staff or fellow diners looking at
- * the roster. Authorization is the caller's job (see session-participants-access.ts);
+ * the roster. Authorization is the caller's job (see session-actor.ts);
  * this function assumes it has already run.
  */
 export const getParticipants = async (

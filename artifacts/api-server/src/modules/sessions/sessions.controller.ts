@@ -1,7 +1,8 @@
 import { type Request, type Response, type NextFunction } from "express";
 import * as sessionsService from "./sessions.service.js";
 import { createError } from "../../middleware/errorHandler.js";
-import { authorizeParticipantsAccess, loadSessionForRoster } from "./session-participants-access.js";
+import { loadSessionContext, resolveSessionActor } from "./session-actor.js";
+import * as sessionLockService from "./session-lock.service.js";
 
 export const joinSession = async (
   req: Request,
@@ -88,9 +89,44 @@ export const getParticipants = async (
 ): Promise<void> => {
   try {
     const { sessionId } = req.params as { sessionId: string };
-    const session = await loadSessionForRoster(sessionId);
-    await authorizeParticipantsAccess(req.user!.id, session);
+    const session = await loadSessionContext(sessionId);
+    // Staff of the branch, or a diner currently seated here. Nobody else.
+    await resolveSessionActor(req.user!.id, session);
     const result = await sessionsService.getParticipants(sessionId);
+    res.json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const lockSession = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { sessionId } = req.params as { sessionId: string };
+    const result = await sessionLockService.lockSession({
+      sessionId,
+      authUserId: req.user!.id,
+    });
+    res.json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const unlockSession = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { sessionId } = req.params as { sessionId: string };
+    const result = await sessionLockService.unlockSession({
+      sessionId,
+      authUserId: req.user!.id,
+    });
     res.json({ data: result });
   } catch (err) {
     next(err);
