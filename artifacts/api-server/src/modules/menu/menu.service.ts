@@ -1,6 +1,16 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
+import {
+  assertCanBecomeSubcategory,
+  assertValidParent,
+  getParentId,
+  hierarchyInstalled,
+  hierarchyStillValid,
+  listSubcategories,
+  loadCategory,
+  requireHierarchyInstalled,
+} from "./category-hierarchy.js";
 
 export const getBranchMenu = async (params: {
   branchId: string;
@@ -107,8 +117,47 @@ export const getBranchMenu = async (params: {
 
   return {
     categories: enrichedCategories,
+    category_tree: buildCategoryTree(enrichedCategories),
     active_time_slot: activeSlot ?? null,
   };
+};
+
+/**
+ * Two-level view of the same categories the flat `categories` array carries.
+ *
+ * The flat array stays exactly as it was (the mobile app reads it), so this is
+ * a pure addition: every category appears in `categories`, and again in
+ * `category_tree` either as a root or under its parent.
+ *
+ * A category whose parent is NOT in the fetched set — parent deactivated, or a
+ * `category_id` filter narrowed the query — is emitted as a root, so no
+ * products can silently disappear from the tree.
+ */
+const buildCategoryTree = (
+  categories: Record<string, unknown>[],
+): Record<string, unknown>[] => {
+  const present = new Set(categories.map((c) => c["id"] as string));
+  const childrenOf = new Map<string, Record<string, unknown>[]>();
+  const roots: Record<string, unknown>[] = [];
+
+  for (const category of categories) {
+    const parentId = getParentId(category);
+    if (parentId && present.has(parentId)) {
+      const siblings = childrenOf.get(parentId) ?? [];
+      siblings.push(category);
+      childrenOf.set(parentId, siblings);
+    } else {
+      roots.push(category);
+    }
+  }
+
+  return roots.map((root) => ({
+    ...root,
+    subcategories: (childrenOf.get(root["id"] as string) ?? []).map((child) => ({
+      ...child,
+      subcategories: [] as Record<string, unknown>[],
+    })),
+  }));
 };
 
 export const searchMenu = async (
@@ -572,19 +621,38 @@ export const createCategory = async (params: {
   name: string;
   description?: string;
   display_order?: number;
+  parent_category_id?: string | null;
   employeeId: string;
 }): Promise<object> => {
-  const { branchId, name, description, display_order, employeeId } = params;
+  const { branchId, name, description, display_order, parent_category_id, employeeId } = params;
+
+  const parentId =
+    typeof parent_category_id === "string" && parent_category_id.trim().length > 0
+      ? parent_category_id.trim()
+      : null;
+
+  if (parentId) {
+    await requireHierarchyInstalled();
+    await assertValidParent({ parentCategoryId: parentId, branchId });
+  }
+
+  const insertPayload: Record<string, unknown> = {
+    branch_id: branchId,
+    name,
+    description,
+    display_order,
+    is_active: true,
+  };
+
+  // Only send the column when the migration is applied, so a pre-migration
+  // database keeps creating top-level categories instead of erroring.
+  if (await hierarchyInstalled()) {
+    insertPayload["parent_category_id"] = parentId;
+  }
 
   const { data, error } = await supabaseAdmin
     .from("menu_categories")
-    .insert({
-      branch_id: branchId,
-      name,
-      description,
-      display_order,
-      is_active: true,
-    })
+    .insert(insertPayload)
     .select("*")
     .single();
 
@@ -592,10 +660,23 @@ export const createCategory = async (params: {
     throw createError(error?.message ?? "Failed to create category", 500, "CREATE_FAILED");
   }
 
+  const categoryId = (data as Record<string, unknown>)["id"] as string;
+
+  // The parent could have been demoted between the check above and this insert.
+  // Nothing points at this row yet, so undoing it is safe.
+  if (parentId && !(await hierarchyStillValid({ categoryId, parentCategoryId: parentId }))) {
+    await supabaseAdmin.from("menu_categories").delete().eq("id", categoryId);
+    throw createError(
+      "The parent category changed while this subcategory was being created: try again",
+      409,
+      "HIERARCHY_CONFLICT",
+    );
+  }
+
   await supabaseAdmin.from("menu_change_log").insert({
     branch_id: branchId,
     entity_type: "category",
-    entity_id: (data as Record<string, unknown>)["id"],
+    entity_id: categoryId,
     change_type: "create",
     changed_by: await resolveEmployeeId(employeeId),
     changed_at: new Date().toISOString(),
@@ -604,12 +685,113 @@ export const createCategory = async (params: {
   return data;
 };
 
+const CATEGORY_UPDATE_FIELDS = [
+  "name",
+  "description",
+  "display_order",
+  "is_active",
+  "parent_category_id",
+] as const;
+
 export const updateCategory = async (params: {
   categoryId: string;
-  updates: Partial<{ name: string; description: string; display_order: number; is_active: boolean }>;
+  updates: Partial<{
+    name: string;
+    description: string;
+    display_order: number;
+    is_active: boolean;
+    parent_category_id: string | null;
+  }>;
+  cascade?: boolean;
   employeeId: string;
 }): Promise<object> => {
-  const { categoryId, updates, employeeId } = params;
+  const { categoryId, updates, cascade, employeeId } = params;
+
+  const unknownFields = Object.keys(updates).filter(
+    (key) => !(CATEGORY_UPDATE_FIELDS as readonly string[]).includes(key),
+  );
+  if (unknownFields.length > 0) {
+    throw createError(
+      `Unsupported field(s): ${unknownFields.join(", ")}`,
+      400,
+      "UNKNOWN_FIELD",
+    );
+  }
+  if (Object.keys(updates).length === 0) {
+    throw createError("No fields to update", 400, "MISSING_FIELDS");
+  }
+
+  const current = await loadCategory(categoryId);
+  const branchId = current["branch_id"] as string;
+
+  // Re-parenting: validate the new parent and make sure this category has no
+  // children of its own (that would produce a third level).
+  if (Object.prototype.hasOwnProperty.call(updates, "parent_category_id")) {
+    await requireHierarchyInstalled();
+    const rawParent = updates.parent_category_id;
+    const nextParentId =
+      typeof rawParent === "string" && rawParent.trim().length > 0 ? rawParent.trim() : null;
+
+    if (nextParentId) {
+      await assertValidParent({ parentCategoryId: nextParentId, branchId, categoryId });
+      await assertCanBecomeSubcategory(categoryId);
+    }
+    updates.parent_category_id = nextParentId;
+  }
+
+  // Soft-deleting a parent: never orphan its subcategories. Block by default,
+  // cascade the soft-delete only when the caller asks for it explicitly.
+  let cascadedSubcategories: Record<string, unknown>[] = [];
+  if (updates.is_active === false && getParentId(current) === null) {
+    const activeChildren = await listSubcategories(categoryId, { activeOnly: true });
+    if (activeChildren.length > 0) {
+      if (!cascade) {
+        throw createError(
+          `This category has ${activeChildren.length} active subcategory(ies): deactivate them first, or resend with cascade=true`,
+          409,
+          "CATEGORY_HAS_SUBCATEGORIES",
+        );
+      }
+      cascadedSubcategories = activeChildren;
+    }
+  }
+
+  // Resolved before any write: a failure here must not leave the menu
+  // half-updated just because the audit actor could not be looked up.
+  const changedBy = await resolveEmployeeId(employeeId);
+  const changedAt = new Date().toISOString();
+
+  // Children go down BEFORE the parent. There is no transaction, so if the
+  // second write fails the menu is left with inactive subcategories under an
+  // active parent — visibly incomplete but never an active subcategory hanging
+  // off a hidden parent, and a retry converges.
+  if (cascadedSubcategories.length > 0) {
+    const childIds = cascadedSubcategories.map((child) => child["id"] as string);
+    const { error: cascadeError } = await supabaseAdmin
+      .from("menu_categories")
+      .update({ is_active: false })
+      .in("id", childIds);
+
+    if (cascadeError) {
+      throw createError(
+        `Could not deactivate the subcategories, so the category was left active: ${cascadeError.message}`,
+        500,
+        "CASCADE_FAILED",
+      );
+    }
+
+    await supabaseAdmin.from("menu_change_log").insert(
+      childIds.map((childId) => ({
+        branch_id: branchId,
+        entity_type: "category",
+        entity_id: childId,
+        change_type: "update",
+        new_value: JSON.stringify({ is_active: false, cascaded_from: categoryId }),
+        changed_by: changedBy,
+        changed_at: changedAt,
+      })),
+    );
+  }
 
   const { data, error } = await supabaseAdmin
     .from("menu_categories")
@@ -622,17 +804,35 @@ export const updateCategory = async (params: {
     throw createError(error?.message ?? "Category not found", 404, "NOT_FOUND");
   }
 
+  // The parent could have been demoted by a concurrent edit between the check
+  // and this write. Undo our own move rather than leave a third level behind.
+  const appliedParentId = getParentId(data as Record<string, unknown>);
+  if (appliedParentId && !(await hierarchyStillValid({ categoryId, parentCategoryId: appliedParentId }))) {
+    await supabaseAdmin
+      .from("menu_categories")
+      .update({ parent_category_id: getParentId(current) })
+      .eq("id", categoryId);
+    throw createError(
+      "The category tree changed while this move was being applied: try again",
+      409,
+      "HIERARCHY_CONFLICT",
+    );
+  }
+
   await supabaseAdmin.from("menu_change_log").insert({
     branch_id: (data as Record<string, unknown>)["branch_id"],
     entity_type: "category",
     entity_id: categoryId,
     change_type: "update",
     new_value: JSON.stringify(updates),
-    changed_by: await resolveEmployeeId(employeeId),
-    changed_at: new Date().toISOString(),
+    changed_by: changedBy,
+    changed_at: changedAt,
   });
 
-  return data;
+  return {
+    ...(data as Record<string, unknown>),
+    cascaded_subcategory_ids: cascadedSubcategories.map((child) => child["id"]),
+  };
 };
 
 export const getChangeLog = async (params: {

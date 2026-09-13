@@ -178,15 +178,22 @@ export const createCategory = async (
 ): Promise<void> => {
   try {
     const { branchId } = req.params as { branchId: string };
-    const { name } = req.body as { name?: string };
+    const { name, description, display_order, parent_category_id } = req.body as {
+      name?: string;
+      description?: string;
+      display_order?: number;
+      parent_category_id?: string | null;
+    };
 
-    if (!name) {
+    if (!name || name.trim().length === 0) {
       return next(createError("name is required", 400, "MISSING_FIELDS"));
     }
 
-    const catBody = req.body as Omit<Parameters<typeof menuService.createCategory>[0], "branchId" | "employeeId">;
     const result = await menuService.createCategory({
-      ...catBody,
+      name: name.trim(),
+      description,
+      display_order,
+      parent_category_id: parent_category_id ?? null,
       branchId,
       employeeId: req.user!.id,
     });
@@ -204,9 +211,14 @@ export const updateCategory = async (
 ): Promise<void> => {
   try {
     const { categoryId } = req.params as { categoryId: string };
+    const { cascade, ...updates } = (req.body ?? {}) as Record<string, unknown> & {
+      cascade?: boolean;
+    };
+
     const result = await menuService.updateCategory({
       categoryId,
-      updates: req.body as Parameters<typeof menuService.updateCategory>[0]["updates"],
+      updates: updates as Parameters<typeof menuService.updateCategory>[0]["updates"],
+      cascade: cascade === true,
       employeeId: req.user!.id,
     });
     res.json({ data: result });
