@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
+import { resolveOrderingParticipant } from "./order-actor.js";
 import { logger } from "../../lib/logger.js";
 import {
   assertCancellationAllowed,
@@ -22,6 +23,113 @@ interface OrderItem {
   modifications?: Array<{ option_id: string }>;
 }
 
+interface PricedItem {
+  item: OrderItem;
+  unitPrice: number;
+  /** Deduplicated: sending the same option twice does not charge it twice. */
+  optionIds: string[];
+  total: number;
+}
+
+/**
+ * Price every line against the database before anything is written.
+ *
+ * The extras live in `modification_options`, grouped per product by
+ * `modification_groups`. A previous version read a `product_options` table
+ * that does not exist and swallowed the error, so every extra was priced at
+ * zero - a pizza with a 35.000 Gs stuffed crust was charged as a plain pizza.
+ */
+const priceItems = async (
+  items: OrderItem[],
+  priceMap: Map<string, number>,
+): Promise<PricedItem[]> => {
+  const optionIds = [
+    ...new Set(items.flatMap((item) => (item.modifications ?? []).map((m) => m.option_id))),
+  ];
+
+  const optionMap = new Map<string, Record<string, unknown>>();
+
+  if (optionIds.length) {
+    const { data: options, error: optionError } = await supabaseAdmin
+      .from("modification_options")
+      .select("id, additional_price, is_available, modification_groups(product_id)")
+      .in("id", optionIds);
+
+    if (optionError) {
+      throw createError(optionError.message, 500, "MODIFICATION_LOOKUP_FAILED");
+    }
+
+    for (const option of (options ?? []) as Array<Record<string, unknown>>) {
+      optionMap.set(option["id"] as string, option);
+    }
+  }
+
+  return items.map((item) => {
+    const unitPrice = priceMap.get(item.product_id) ?? 0;
+    const uniqueOptionIds = [...new Set((item.modifications ?? []).map((m) => m.option_id))];
+    let modTotal = 0;
+
+    for (const optionId of uniqueOptionIds) {
+      const option = optionMap.get(optionId);
+
+      if (!option) {
+        throw createError(`Modification ${optionId} not found`, 404, "MODIFICATION_NOT_FOUND");
+      }
+
+      if (option["is_available"] === false) {
+        throw createError(`Modification ${optionId} is not available`, 400, "MODIFICATION_UNAVAILABLE");
+      }
+
+      // An option belonging to another product would otherwise be priced into
+      // this line - the client never decides what a thing costs.
+      const group = option["modification_groups"] as Record<string, unknown> | null;
+
+      if (!group) {
+        throw createError(
+          `Modification ${optionId} has no product group`,
+          400,
+          "MODIFICATION_GROUP_MISSING",
+        );
+      }
+
+      if (group["product_id"] !== item.product_id) {
+        throw createError(
+          `Modification ${optionId} does not belong to product ${item.product_id}`,
+          400,
+          "MODIFICATION_PRODUCT_MISMATCH",
+        );
+      }
+
+      modTotal += (option["additional_price"] as number | null) ?? 0;
+    }
+
+    return {
+      item,
+      unitPrice,
+      optionIds: uniqueOptionIds,
+      total: (unitPrice + modTotal) * item.quantity,
+    };
+  });
+};
+
+/**
+ * Undo a partially written order. Supabase REST has no transaction, so the
+ * only way an incomplete order does not reach the kitchen is deleting what was
+ * already written. Failure here is logged, never thrown: the caller is already
+ * reporting the original error.
+ */
+const rollbackOrder = async (orderId: string, itemIds: string[]): Promise<void> => {
+  try {
+    for (const itemId of itemIds) {
+      await supabaseAdmin.from("order_item_modifications").delete().eq("order_item_id", itemId);
+    }
+    await supabaseAdmin.from("order_items").delete().eq("order_id", orderId);
+    await supabaseAdmin.from("orders").delete().eq("id", orderId);
+  } catch (err) {
+    logger.error({ order_id: orderId, err }, "failed to roll back a partial order");
+  }
+};
+
 const buildOrder = async (params: {
   session_id?: string;
   branch_id?: string;
@@ -29,9 +137,11 @@ const buildOrder = async (params: {
   notes?: string;
   order_type: string;
   user_id?: string;
+  participant_id?: string;
   requested_time?: string;
 }): Promise<object> => {
-  const { session_id, branch_id, items, notes, order_type, user_id, requested_time } = params;
+  const { session_id, branch_id, items, notes, order_type, user_id, participant_id, requested_time } =
+    params;
 
   let resolvedBranchId = branch_id;
 
@@ -73,11 +183,21 @@ const buildOrder = async (params: {
     products.map((p) => [(p as Record<string, unknown>)["id"] as string, (p as Record<string, unknown>)["price"] as number]),
   );
 
+  // Everything is priced and validated BEFORE the first row is written, so a
+  // rejected modification can no longer leave a zero-total order sitting in
+  // the kitchen queue. There are no transactions here; not writing at all is
+  // the only rollback that never fails.
+  const pricedItems = await priceItems(items, priceMap);
+  const totalAmount = pricedItems.reduce((sum, item) => sum + item.total, 0);
+
   const orderInsert: Record<string, unknown> = {
     order_type,
     status: "received",
     received_at: new Date().toISOString(),
     notes,
+    // Written with the order, not patched afterwards: an unchecked follow-up
+    // update could leave a visible order sitting at a total of zero.
+    total_amount: totalAmount,
   };
 
   if (session_id) orderInsert["session_id"] = session_id;
@@ -86,6 +206,9 @@ const buildOrder = async (params: {
   // and writing it made every employee-created order fail. Traditional orders
   // record their author in audit_log instead (see createTraditionalOrder).
   if (user_id) orderInsert["user_id"] = user_id;
+  // Always set for a diner order: it is the only column that says WHICH person
+  // at the table ordered, and the split/payment logic reads it.
+  if (participant_id) orderInsert["participant_id"] = participant_id;
   if (requested_time) orderInsert["requested_time"] = requested_time;
 
   const { data: order, error: orderError } = await supabaseAdmin
@@ -98,74 +221,114 @@ const buildOrder = async (params: {
     throw createError(orderError?.message ?? "Failed to create order", 500, "ORDER_CREATE_FAILED");
   }
 
-  let totalAmount = 0;
+  const orderId = (order as Record<string, unknown>)["id"] as string;
   const createdItems = [];
+  const createdItemIds: string[] = [];
 
-  for (const item of items) {
-    const unitPrice = priceMap.get(item.product_id) ?? 0;
+  try {
+    for (const priced of pricedItems) {
+      const { item, unitPrice } = priced;
 
-    let modTotal = 0;
-    if (item.modifications?.length) {
-      const optionIds = item.modifications.map((m) => m.option_id);
-      const { data: options } = await supabaseAdmin
-        .from("product_options")
-        .select("id, additional_price")
-        .in("id", optionIds);
+      const { data: orderItem, error: itemError } = await supabaseAdmin
+        .from("order_items")
+        .insert({
+          order_id: orderId,
+          product_id: item.product_id,
+          quantity: item.quantity,
+          unit_price: unitPrice,
+          total_price: priced.total,
+          notes: item.notes,
+          status: "received",
+        })
+        .select("*")
+        .single();
 
-      modTotal = (options ?? []).reduce(
-        (sum: number, o: Record<string, unknown>) => sum + ((o["additional_price"] as number) ?? 0),
-        0,
-      );
+      if (itemError || !orderItem) {
+        throw createError(itemError?.message ?? "Failed to create order item", 500, "ITEM_CREATE_FAILED");
+      }
+
+      const orderItemId = (orderItem as Record<string, unknown>)["id"] as string;
+      createdItemIds.push(orderItemId);
+
+      if (priced.optionIds.length) {
+        // The column is `modification_option_id`; writing `option_id` made
+        // every insert fail, and the error was never read - the extras were
+        // charged but never reached the kitchen ticket.
+        const { error: modError } = await supabaseAdmin.from("order_item_modifications").insert(
+          priced.optionIds.map((optionId) => ({
+            order_item_id: orderItemId,
+            modification_option_id: optionId,
+          })),
+        );
+
+        if (modError) {
+          throw createError(modError.message, 500, "MODIFICATION_SAVE_FAILED");
+        }
+      }
+
+      createdItems.push(orderItem);
     }
 
-    const itemTotal = (unitPrice + modTotal) * item.quantity;
-    totalAmount += itemTotal;
+    // The authorization above was true a few writes ago. If the table was
+    // closed in the meantime the order must not survive: there is no lock to
+    // take, so the check runs again and the write undoes itself.
+    if (session_id) {
+      const { data: sessionNow, error: sessionError } = await supabaseAdmin
+        .from("table_sessions")
+        .select("status")
+        .eq("id", session_id)
+        .maybeSingle();
 
-    const { data: orderItem, error: itemError } = await supabaseAdmin
-      .from("order_items")
-      .insert({
-        order_id: (order as Record<string, unknown>)["id"],
-        product_id: item.product_id,
-        quantity: item.quantity,
-        unit_price: unitPrice,
-        total_price: itemTotal,
-        notes: item.notes,
-        status: "received",
-      })
-      .select("*")
-      .single();
+      if (sessionError) {
+        throw createError(sessionError.message, 500, "SESSION_LOOKUP_FAILED");
+      }
 
-    if (itemError || !orderItem) {
-      throw createError(itemError?.message ?? "Failed to create order item", 500, "ITEM_CREATE_FAILED");
+      const status = ((sessionNow as Record<string, unknown> | null)?.["status"] as string) ?? "active";
+
+      if (status !== "active") {
+        throw createError("This session is no longer active", 409, "SESSION_NOT_ACTIVE", {
+          session_id,
+          status,
+        });
+      }
     }
-
-    if (item.modifications?.length) {
-      await supabaseAdmin.from("order_item_modifications").insert(
-        item.modifications.map((m) => ({
-          order_item_id: (orderItem as Record<string, unknown>)["id"],
-          option_id: m.option_id,
-        })),
-      );
-    }
-
-    createdItems.push(orderItem);
+  } catch (err) {
+    await rollbackOrder(orderId, createdItemIds);
+    throw err;
   }
-
-  await supabaseAdmin
-    .from("orders")
-    .update({ total_amount: totalAmount })
-    .eq("id", (order as Record<string, unknown>)["id"]);
 
   return { ...(order as object), total_amount: totalAmount, order_items: createdItems };
 };
 
+/**
+ * A diner order placed from the app or from the web.
+ *
+ * Authorization happens BEFORE any row is written: the seat is resolved and
+ * checked (active session, active participant, signed in when the platform
+ * demands it, not expelled), and the attribution is taken from that seat -
+ * never from the request body and never from the token.
+ */
 export const createOrder = async (params: {
   session_id: string;
   items: OrderItem[];
   notes?: string;
-  user_id?: string;
+  participant_id?: string;
+  auth_user_id?: string;
 }): Promise<object> => {
-  return buildOrder({ ...params, order_type: "digital" });
+  const actor = await resolveOrderingParticipant({
+    sessionId: params.session_id,
+    participantId: params.participant_id,
+    authUserId: params.auth_user_id,
+  });
+
+  return buildOrder({
+    session_id: params.session_id,
+    items: params.items,
+    notes: params.notes,
+    order_type: "digital",
+    participant_id: actor.participantId,
+    user_id: actor.userId ?? undefined,
+  });
 };
 
 export const createTraditionalOrder = async (params: {

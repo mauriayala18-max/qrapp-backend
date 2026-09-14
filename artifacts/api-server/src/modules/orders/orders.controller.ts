@@ -8,8 +8,9 @@ export const createOrder = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { session_id, items, notes } = req.body as {
+    const { session_id, participant_id, items, notes } = req.body as {
       session_id?: string;
+      participant_id?: string;
       items?: unknown[];
       notes?: string;
     };
@@ -22,7 +23,10 @@ export const createOrder = async (
       session_id,
       items: items as Parameters<typeof ordersService.createOrder>[0]["items"],
       notes,
-      user_id: req.user?.id,
+      // Who the caller CLAIMS to be. The service verifies the seat against the
+      // session before a single row is written.
+      participant_id: participant_id ?? undefined,
+      auth_user_id: req.user?.id,
     });
 
     res.status(201).json({ data: result });

@@ -224,7 +224,7 @@ export const loadActiveParticipant = async (
 ): Promise<Record<string, unknown> | null> => {
   const { data, error } = await supabaseAdmin
     .from("session_participants")
-    .select("id, user_id, web_name, disconnected_at")
+    .select("id, user_id, web_name, platform, connection_method, disconnected_at")
     .eq("session_id", sessionId)
     .eq("id", participantId)
     .is("disconnected_at", null)
