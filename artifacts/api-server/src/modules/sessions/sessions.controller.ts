@@ -1,7 +1,11 @@
 import { type Request, type Response, type NextFunction } from "express";
 import * as sessionsService from "./sessions.service.js";
 import { createError } from "../../middleware/errorHandler.js";
-import { loadSessionContext, resolveSessionActor } from "./session-actor.js";
+import {
+  loadSessionContext,
+  resolveSessionActor,
+  resolveSessionReadAccess,
+} from "./session-actor.js";
 import * as sessionLockService from "./session-lock.service.js";
 
 export const joinSession = async (
@@ -75,7 +79,18 @@ export const getSession = async (
 ): Promise<void> => {
   try {
     const { sessionId } = req.params as { sessionId: string };
-    const result = await sessionsService.getSession(sessionId);
+    const participantId =
+      typeof req.query["participant_id"] === "string" ? (req.query["participant_id"] as string) : undefined;
+
+    const session = await loadSessionContext(sessionId);
+    // Staff of the branch, the session's own seated diner, or (only for a
+    // guest seat with no account) whoever presents that seat's id.
+    const actor = await resolveSessionReadAccess({ session, authUserId: req.user?.id, participantId });
+
+    // Staff sees the table as-is; a diner sees every seat's display name but
+    // only their own seat's id and account (see getSession's redaction).
+    const viewerParticipantId = actor.kind === "staff" ? undefined : actor.participantId;
+    const result = await sessionsService.getSession(sessionId, viewerParticipantId);
     res.json({ data: result });
   } catch (err) {
     next(err);

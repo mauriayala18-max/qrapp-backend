@@ -10,7 +10,9 @@ const router: IRouter = Router();
 
 router.post("/join", optionalAuthenticate, sessionsController.joinSession);
 router.post("/scan", optionalAuthenticate, sessionsController.scanAndJoin);
-router.get("/:sessionId", authenticate, sessionsController.getSession);
+// An active web participant proves membership with their own participant_id
+// (no account exists for them to log into); everyone else needs their JWT.
+router.get("/:sessionId", optionalAuthenticate, sessionsController.getSession);
 router.get("/:sessionId/participants", authenticate, sessionsController.getParticipants);
 router.post("/:sessionId/close", authenticate, requireEmployee, sessionsController.closeSession);
 router.post("/:sessionId/call-waiter", optionalAuthenticate, waiterCallsController.callWaiter);

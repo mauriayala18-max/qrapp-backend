@@ -641,53 +641,34 @@ export const scanAndJoin = async (params: {
   };
 };
 
-export const getSession = async (sessionId: string): Promise<object> => {
-  const { data: session, error } = await supabaseAdmin
-    .from("table_sessions")
-    .select("*, tables(*, branches(*, restaurants(*))), session_participants(*), orders(*, order_items(*, order_item_modifications(*)))")
-    .eq("id", sessionId)
-    .single();
-
-  if (error || !session) {
-    throw createError("Session not found", 404, "SESSION_NOT_FOUND");
-  }
-
-  return session;
-};
-
 /**
- * The list of diners currently at a table.
+ * Turn raw `session_participants` rows into the display shape the web status
+ * screen and the roster endpoint both need: a name to show, never a raw user
+ * id. Shared so the two never format a diner's name differently.
  *
- * Only ACTIVE participants (disconnected_at IS NULL) are returned - someone
- * who already left is not "at the table" for staff or fellow diners looking at
- * the roster. Authorization is the caller's job (see session-actor.ts);
- * this function assumes it has already run.
+ * `viewerParticipantId` marks which row is "me". Every OTHER row has its
+ * `participant_id` withheld: that field doubles as a guest seat's login
+ * credential (see order-actor.ts / session-actor.ts), so handing it out for
+ * every diner at the table would let one guest read or order as another. A
+ * display name is not a credential and stays visible to the whole table, as
+ * it always has.
  */
-export const getParticipants = async (
-  sessionId: string,
-): Promise<{
-  session_id: string;
-  total: number;
-  participants: Array<{
-    participant_id: string;
+const summarizeParticipants = async (
+  rows: Array<Record<string, unknown>>,
+  viewerParticipantId?: string,
+): Promise<
+  Array<{
+    participant_id: string | null;
+    is_me: boolean;
     display_name: string;
     is_registered_user: boolean;
     connection_method: string | null;
     joined_at: string | null;
-  }>;
-}> => {
-  const { data, error } = await supabaseAdmin
-    .from("session_participants")
-    .select("id, user_id, web_name, connection_method, joined_at")
-    .eq("session_id", sessionId)
-    .is("disconnected_at", null);
-
-  if (error) {
-    throw createError(error.message, 500, "FETCH_FAILED");
-  }
-
-  const rows = (data ?? []) as Array<Record<string, unknown>>;
-  const userIds = [...new Set(rows.map((r) => r["user_id"] as string | null).filter((id): id is string => Boolean(id)))];
+  }>
+> => {
+  const userIds = [
+    ...new Set(rows.map((r) => r["user_id"] as string | null).filter((id): id is string => Boolean(id))),
+  ];
 
   const namesByUserId = new Map<string, string>();
   if (userIds.length > 0) {
@@ -706,19 +687,140 @@ export const getParticipants = async (
     }
   }
 
-  const participants = rows.map((row) => {
+  return rows.map((row) => {
+    const rowId = row["id"] as string;
     const userId = row["user_id"] as string | null;
     const webName = row["web_name"] as string | null;
     const displayName = (userId ? namesByUserId.get(userId) : null) ?? webName ?? "Invitado";
+    const isMe = viewerParticipantId === undefined || rowId === viewerParticipantId;
 
     return {
-      participant_id: row["id"] as string,
+      participant_id: isMe ? rowId : null,
+      is_me: isMe,
       display_name: displayName,
       is_registered_user: Boolean(userId),
       connection_method: (row["connection_method"] as string | null) ?? null,
       joined_at: (row["joined_at"] as string | null) ?? null,
     };
   });
+};
+
+/**
+ * Withhold another diner's bearer credential and account id from a
+ * `session_participants` row. Applied only for a non-staff caller: staff
+ * already administers the table and needs the real rows to act on it.
+ *
+ * Every other field is left untouched on purpose, so a client that reads,
+ * say, `.web_name` or `.platform` off this array keeps working; only the two
+ * fields that double as a credential (`id`) or expose another account
+ * (`user_id`) are nulled for anyone who isn't the caller.
+ */
+const redactParticipantRow = (
+  row: Record<string, unknown>,
+  viewerParticipantId: string | undefined,
+): Record<string, unknown> => {
+  if (viewerParticipantId !== undefined && row["id"] === viewerParticipantId) return row;
+  return { ...row, id: null, user_id: null };
+};
+
+/** Same redaction, applied to an order's attribution fields. */
+const redactOrderRow = (
+  row: Record<string, unknown>,
+  viewerParticipantId: string | undefined,
+): Record<string, unknown> => {
+  if (viewerParticipantId !== undefined && row["participant_id"] === viewerParticipantId) return row;
+  return { ...row, participant_id: null, user_id: null };
+};
+
+/**
+ * The full state of a table session: table/branch, every diner who has ever
+ * sat there (`session_participants`, kept for backward compatibility with the
+ * app), a friendly `participants` summary with display names, and every order
+ * with its items and status - the payload a status screen (app or anonymous
+ * web) polls to show "Recibido / En preparación / Listo".
+ *
+ * `viewerParticipantId` is undefined for staff (full visibility, they run the
+ * table) and set to the caller's own seat for a diner - anonymous or not.
+ * A diner sees every seat's display name but only their OWN seat's id and
+ * account, on the roster and on each order: knowing the table's state is not
+ * the same as being handed every other diner's credential. Authorization
+ * itself is the caller's job (see session-actor.ts); this function assumes
+ * it has already run.
+ */
+export const getSession = async (
+  sessionId: string,
+  viewerParticipantId?: string,
+): Promise<object> => {
+  const { data: session, error } = await supabaseAdmin
+    .from("table_sessions")
+    .select("*, tables(*, branches(*, restaurants(*))), session_participants(*), orders(*, order_items(*, order_item_modifications(*)))")
+    .eq("id", sessionId)
+    .single();
+
+  if (error || !session) {
+    throw createError("Session not found", 404, "SESSION_NOT_FOUND");
+  }
+
+  const row = session as Record<string, unknown>;
+  const participantRows = (row["session_participants"] ?? []) as Array<Record<string, unknown>>;
+  const activeParticipantRows = participantRows.filter((p) => !p["disconnected_at"]);
+  const orderRows = (row["orders"] ?? []) as Array<Record<string, unknown>>;
+  const isStaff = viewerParticipantId === undefined;
+
+  const tableRow = row["tables"] as Record<string, unknown> | null;
+
+  return {
+    ...row,
+    // A diner already has their own table's live PIN/QR token out of band
+    // (that is how they got here); echoing it back on every poll only helps
+    // someone who does not have it. The session row carries its own copy of
+    // the same credential (`pin`/`session_token`, adopted from the table at
+    // open time) alongside the nested table row - both must be redacted.
+    ...(isStaff ? {} : { pin: null, session_token: null }),
+    tables: isStaff || !tableRow
+      ? tableRow
+      : { ...tableRow, current_pin: null, current_session_token: null },
+    session_participants: isStaff
+      ? participantRows
+      : participantRows.map((p) => redactParticipantRow(p, viewerParticipantId)),
+    orders: isStaff ? orderRows : orderRows.map((o) => redactOrderRow(o, viewerParticipantId)),
+    participants: await summarizeParticipants(activeParticipantRows, viewerParticipantId),
+  };
+};
+
+/**
+ * The list of diners currently at a table.
+ *
+ * Only ACTIVE participants (disconnected_at IS NULL) are returned - someone
+ * who already left is not "at the table" for staff or fellow diners looking at
+ * the roster. Authorization is the caller's job (see session-actor.ts);
+ * this function assumes it has already run.
+ */
+export const getParticipants = async (
+  sessionId: string,
+): Promise<{
+  session_id: string;
+  total: number;
+  participants: Array<{
+    participant_id: string | null;
+    is_me: boolean;
+    display_name: string;
+    is_registered_user: boolean;
+    connection_method: string | null;
+    joined_at: string | null;
+  }>;
+}> => {
+  const { data, error } = await supabaseAdmin
+    .from("session_participants")
+    .select("id, user_id, web_name, connection_method, joined_at")
+    .eq("session_id", sessionId)
+    .is("disconnected_at", null);
+
+  if (error) {
+    throw createError(error.message, 500, "FETCH_FAILED");
+  }
+
+  const participants = await summarizeParticipants((data ?? []) as Array<Record<string, unknown>>);
 
   return {
     session_id: sessionId,

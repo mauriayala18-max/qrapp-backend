@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { logger } from "../../lib/logger.js";
+import { assertNotExpelled } from "../expulsions/expulsion-guard.js";
 
 /**
  * One authorization model for every action scoped to a table session:
@@ -161,6 +162,111 @@ export const resolveSessionActor = async (
   });
 };
 
+/**
+ * Whether a seat may act without proving an account with a JWT.
+ *
+ * A `web` seat with no `user_id` is a guest who never had an account to prove -
+ * the seat itself is all the credential that exists. A `web` seat that DOES
+ * carry a `user_id` (a registered diner who happened to join from a browser)
+ * still needs a token: otherwise anyone who learns that seat's id could act as
+ * a real account. Unknown platforms fail closed. Shared between order creation
+ * and session reads so the two paths cannot drift apart on this rule.
+ */
+export const isAnonymousSeat = (row: Record<string, unknown>): boolean =>
+  (row["platform"] as string | null) === "web" && (row["user_id"] as string | null) == null;
+
+export type SessionReadActor =
+  | { kind: "staff"; authUserId: string; employeeId: string; role: string }
+  | { kind: "participant"; participantId: string; authUserId?: string };
+
+/**
+ * Who may read a session's state, and under which proof - the read-side twin
+ * of `resolveOrderingParticipant`.
+ *
+ * - Staff assigned to the branch may always read it.
+ * - An anonymous web seat (see `isAnonymousSeat`) proves itself with its own
+ *   `participantId` alone: no JWT exists for it to present.
+ * - Any other seat - claimed by id or resolved from the token - must belong to
+ *   the caller's own account.
+ *
+ * Knowing a session id or a participant id proves nothing by itself; every
+ * branch here ends in a real ownership check or a denial.
+ */
+export const resolveSessionReadAccess = async (params: {
+  session: SessionContext;
+  authUserId?: string;
+  participantId?: string;
+}): Promise<SessionReadActor> => {
+  const { session, authUserId, participantId } = params;
+
+  if (authUserId) {
+    const staff = await resolveStaff(authUserId, session.branch_id);
+    if (staff) {
+      return { kind: "staff", authUserId, employeeId: staff.employeeId, role: staff.role };
+    }
+  }
+
+  if (participantId) {
+    const row = await loadActiveParticipant(session.id, participantId);
+
+    if (!row) {
+      return denySession("PARTICIPANT_NOT_IN_SESSION", "You are not seated at this table", {
+        session_id: session.id,
+        participant_id: participantId,
+      });
+    }
+
+    const rowUserId = (row["user_id"] as string | null) ?? null;
+    const rowWebName = (row["web_name"] as string | null) ?? null;
+
+    // A seat can survive an expulsion race the same way an order can (see
+    // expulsion-guard.ts): the ban is the door, not the row's disconnected_at.
+    await assertNotExpelled({
+      sessionId: session.id,
+      userId: rowUserId ?? undefined,
+      webName: rowUserId ? undefined : rowWebName ?? undefined,
+    });
+
+    if (isAnonymousSeat(row)) {
+      return { kind: "participant", participantId: row["id"] as string };
+    }
+
+    // This seat has an account behind it - the id alone is not enough.
+    if (!authUserId) {
+      return denySession(
+        "AUTH_REQUIRED",
+        "This participant must be signed in to read this session",
+        { session_id: session.id, participant_id: participantId },
+      );
+    }
+
+    if (rowUserId !== authUserId) {
+      return denySession("PARTICIPANT_MISMATCH", "This participant is not yours", {
+        session_id: session.id,
+        participant_id: participantId,
+        auth_user_id: authUserId,
+      });
+    }
+
+    return { kind: "participant", participantId: row["id"] as string, authUserId };
+  }
+
+  // No claimed seat: fall back to the caller's own seat, same as the app's
+  // existing order-creation request shape.
+  if (authUserId) {
+    const ownParticipantId = await resolveParticipant(authUserId, session.id);
+    if (ownParticipantId) {
+      await assertNotExpelled({ sessionId: session.id, userId: authUserId });
+      return { kind: "participant", participantId: ownParticipantId, authUserId };
+    }
+  }
+
+  return denySession("FORBIDDEN", "You are not part of this session", {
+    auth_user_id: authUserId ?? null,
+    session_id: session.id,
+  });
+};
+
 /** Narrow an actor to staff with one of the allowed roles, or throw 403. */
 export const requireStaffActor = (
   actor: SessionActor,
@@ -217,7 +323,16 @@ export const listActiveParticipantIds = async (sessionId: string): Promise<strin
   return ((data ?? []) as Array<Record<string, unknown>>).map((row) => row["id"] as string);
 };
 
-/** A participant row of this session that is still connected, or null. */
+/** Postgres' "invalid input syntax for type uuid" - a garbage id, not a server fault. */
+const isInvalidUuidError = (error: { code?: string } | null): boolean => error?.code === "22P02";
+
+/**
+ * A participant row of this session that is still connected, or null.
+ *
+ * A malformed id (not a UUID at all) must read the same as an id that simply
+ * doesn't exist - a probing caller learns nothing extra, and a made-up value
+ * is common enough client noise that it must not surface as a 500.
+ */
 export const loadActiveParticipant = async (
   sessionId: string,
   participantId: string,
@@ -231,6 +346,7 @@ export const loadActiveParticipant = async (
     .maybeSingle();
 
   if (error) {
+    if (isInvalidUuidError(error)) return null;
     throw createError(error.message, 500, "PARTICIPANT_LOOKUP_FAILED");
   }
 

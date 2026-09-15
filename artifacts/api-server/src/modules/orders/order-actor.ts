@@ -4,6 +4,7 @@ import { logger } from "../../lib/logger.js";
 import { assertNotExpelled } from "../expulsions/expulsion-guard.js";
 import {
   assertSessionActive,
+  isAnonymousSeat,
   loadActiveParticipant,
   loadSessionContext,
 } from "../sessions/session-actor.js";
@@ -122,14 +123,10 @@ export const resolveOrderingParticipant = async (params: {
   const platform = (row["platform"] as string | null) ?? null;
   const webName = (row["web_name"] as string | null) ?? null;
 
-  // Anonymous is allowed only for a seat that has no account behind it. A
-  // registered diner who joined from the web still carries a `user_id`, and
-  // letting that seat order without a token would downgrade a real account to
-  // "anyone who knows the id". The platform alone does not decide; the
-  // presence of an account does. Unknown platforms fail closed.
-  const anonymousAllowed = platform === "web" && userId === null;
-
-  if (!anonymousAllowed) {
+  // Anonymous is allowed only for a seat that has no account behind it (see
+  // `isAnonymousSeat`) - shared with the session-read path so the two cannot
+  // drift apart on this rule.
+  if (!isAnonymousSeat(row)) {
     if (!authUserId) {
       return denyOrder("AUTH_REQUIRED", "This participant must be signed in to order", 401, {
         session_id: sessionId,
