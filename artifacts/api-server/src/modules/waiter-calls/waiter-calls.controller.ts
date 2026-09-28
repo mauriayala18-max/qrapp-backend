@@ -9,9 +9,10 @@ export const callWaiter = async (
 ): Promise<void> => {
   try {
     const { sessionId } = req.params as { sessionId: string };
-    const { reason_id, custom_reason } = req.body as {
+    const { reason_id, custom_reason, participant_id } = req.body as {
       reason_id?: string;
       custom_reason?: string;
+      participant_id?: string;
     };
 
     const result = await waiterCallsService.callWaiter({
@@ -19,6 +20,7 @@ export const callWaiter = async (
       reason_id,
       custom_reason,
       userId: req.user?.id,
+      participantId: participant_id,
     });
 
     res.status(201).json({ data: result });

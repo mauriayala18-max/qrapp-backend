@@ -323,6 +323,122 @@ export const listActiveParticipantIds = async (sessionId: string): Promise<strin
   return ((data ?? []) as Array<Record<string, unknown>>).map((row) => row["id"] as string);
 };
 
+export interface SeatProof {
+  participantId: string;
+  userId: string | null;
+  platform: string | null;
+  webName: string | null;
+}
+
+/** Every refusal is logged - a probing caller leaves no other trace. */
+const denySeat = (
+  code: string,
+  message: string,
+  status: number,
+  context: Record<string, unknown>,
+): never => {
+  logger.warn({ code, ...context }, "session actor authorization denied");
+  throw createError(message, status, code);
+};
+
+/**
+ * Identify the diner behind a session-scoped action (placing an order,
+ * calling the waiter, ...) by `participant_id` - the anonymous web seat's own
+ * credential, since it has no account to log into - or by JWT for everyone
+ * else. Mirrors `resolveOrderingParticipant`'s rule exactly so the two rules
+ * cannot drift apart.
+ *
+ * Callers must already have loaded the session and confirmed it is active
+ * (`loadSessionContext` + `assertSessionActive`) before calling this, so a
+ * closed session is refused under the caller's own 404/409 before identity is
+ * even considered.
+ */
+export const resolveSeatProof = async (params: {
+  sessionId: string;
+  participantId?: string;
+  authUserId?: string;
+}): Promise<SeatProof> => {
+  const { sessionId, participantId, authUserId } = params;
+
+  let row: Record<string, unknown> | null;
+
+  if (participantId) {
+    row = await loadActiveParticipant(sessionId, participantId);
+
+    if (!row) {
+      return denySeat("PARTICIPANT_NOT_IN_SESSION", "You are not seated at this table", 403, {
+        session_id: sessionId,
+        participant_id: participantId,
+      });
+    }
+  } else if (authUserId) {
+    const ownParticipantId = await resolveParticipant(authUserId, sessionId);
+
+    if (!ownParticipantId) {
+      return denySeat("NOT_A_PARTICIPANT", "You are not seated at this table", 403, {
+        session_id: sessionId,
+        auth_user_id: authUserId,
+      });
+    }
+
+    row = await loadActiveParticipant(sessionId, ownParticipantId);
+
+    if (!row) {
+      return denySeat("NOT_A_PARTICIPANT", "You are not seated at this table", 403, {
+        session_id: sessionId,
+        auth_user_id: authUserId,
+      });
+    }
+  } else {
+    return denySeat(
+      "IDENTITY_REQUIRED",
+      "participant_id is required when acting without a session token",
+      401,
+      { session_id: sessionId },
+    );
+  }
+
+  const resolvedParticipantId = row["id"] as string;
+  const userId = (row["user_id"] as string | null) ?? null;
+  const platform = (row["platform"] as string | null) ?? null;
+  const webName = (row["web_name"] as string | null) ?? null;
+
+  // Anonymous is allowed only for a seat that has no account behind it (see
+  // `isAnonymousSeat`).
+  if (!isAnonymousSeat(row)) {
+    if (!authUserId) {
+      return denySeat("AUTH_REQUIRED", "This participant must be signed in", 401, {
+        session_id: sessionId,
+        participant_id: resolvedParticipantId,
+        platform,
+        has_account: userId !== null,
+      });
+    }
+
+    if (!userId || userId !== authUserId) {
+      return denySeat("PARTICIPANT_MISMATCH", "This participant is not yours", 401, {
+        session_id: sessionId,
+        participant_id: resolvedParticipantId,
+        auth_user_id: authUserId,
+      });
+    }
+  }
+
+  // A seat can survive an expulsion race; the ban is the door, not the row.
+  await assertNotExpelled({
+    sessionId,
+    userId: userId ?? undefined,
+    webName: userId ? undefined : webName ?? undefined,
+  });
+
+  return {
+    participantId: resolvedParticipantId,
+    userId,
+    platform,
+    webName,
+  };
+};
+
 /** Postgres' "invalid input syntax for type uuid" - a garbage id, not a server fault. */
 const isInvalidUuidError = (error: { code?: string } | null): boolean => error?.code === "22P02";
 

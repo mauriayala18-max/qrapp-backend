@@ -1,41 +1,45 @@
 import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { logger } from "../../lib/logger.js";
-import { resolveEmployeeId, resolveParticipantId } from "../../lib/actors.js";
+import { resolveEmployeeId } from "../../lib/actors.js";
+import { assertSessionActive, loadSessionContext, resolveSeatProof } from "../sessions/session-actor.js";
 
 export const callWaiter = async (params: {
   sessionId: string;
   reason_id?: string;
   custom_reason?: string;
   userId?: string;
-  participantName?: string;
+  participantId?: string;
 }): Promise<object> => {
-  const { sessionId, reason_id, custom_reason, userId } = params;
+  const { sessionId, reason_id, custom_reason, userId, participantId } = params;
 
-  const { data: session, error: sessionError } = await supabaseAdmin
+  // Same identity rule as placing an order: the anonymous web seat proves
+  // itself with its own participant_id (it has no account to log into), the
+  // app keeps proving itself with a JWT. Closed/missing session is refused
+  // before identity is even considered.
+  const session = await loadSessionContext(sessionId);
+  assertSessionActive(session);
+
+  const { data: tableRow, error: tableRowError } = await supabaseAdmin
     .from("table_sessions")
-    .select("id, table_id, branch_id, tables(branch_id)")
+    .select("table_id, tables(branch_id)")
     .eq("id", sessionId)
-    .eq("status", "active")
     .single();
 
-  if (sessionError || !session) {
-    throw createError("Active session not found", 404, "SESSION_NOT_FOUND");
+  if (tableRowError || !tableRow) {
+    throw createError(tableRowError?.message ?? "Session not found", 404, "SESSION_NOT_FOUND");
   }
 
-  const sessionRow = session as Record<string, unknown>;
-  const table = sessionRow["tables"] as Record<string, unknown> | null;
-  const tableId = sessionRow["table_id"] as string | null;
-  const branchId =
-    (sessionRow["branch_id"] as string | null) ?? (table?.["branch_id"] as string | null) ?? null;
+  const tableRowRecord = tableRow as Record<string, unknown>;
+  const tableId = tableRowRecord["table_id"] as string | null;
+  const table = tableRowRecord["tables"] as Record<string, unknown> | null;
+  // table_sessions.branch_id is authoritative; fall back to the table's own
+  // branch for older rows created before that column was backfilled.
+  const branchId = session.branch_id ?? (table?.["branch_id"] as string | null) ?? null;
 
   // `called_by` is NOT NULL and is a FK to session_participants.id - the
   // diner's participant row in THIS session, not their auth user id.
-  if (!userId) {
-    throw createError("A signed-in user is required to call the waiter", 401, "UNAUTHORIZED");
-  }
-
-  const calledByParticipantId = await resolveParticipantId(sessionId, userId);
+  const seat = await resolveSeatProof({ sessionId, participantId, authUserId: userId });
 
   const { data: call, error: callError } = await supabaseAdmin
     .from("waiter_calls")
@@ -43,7 +47,7 @@ export const callWaiter = async (params: {
       session_id: sessionId,
       table_id: tableId,
       branch_id: branchId,
-      called_by: calledByParticipantId,
+      called_by: seat.participantId,
       reason_id: reason_id ?? null,
       custom_reason: custom_reason ?? null,
       status: "pending",
