@@ -5,7 +5,7 @@ const router: IRouter = Router();
 // Bump this marker whenever you need to confirm a fresh production build is
 // actually live (curl /api/healthz and check `build`). The old pre-fix build
 // does not include this field.
-const BUILD_MARKER = "web-waiter-call-2026-09-28";
+const BUILD_MARKER = "panel-polish-2026-09-28";
 
 router.get("/healthz", (_req, res) => {
   res.json({

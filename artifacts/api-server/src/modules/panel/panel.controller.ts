@@ -187,6 +187,16 @@ export const updateBranchSettings = async (req: Request, res: Response, next: Ne
   }
 };
 
+export const getBranchInfo = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { branchId } = req.params as { branchId: string };
+    const result = await panelService.getBranchInfo({ branchId, authUserId: req.user!.id });
+    res.json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+};
+
 export const replaceBranchHours = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { branchId } = req.params as { branchId: string };

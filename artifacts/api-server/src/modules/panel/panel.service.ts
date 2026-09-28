@@ -5,6 +5,7 @@ import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
 import { logger } from "../../lib/logger.js";
+import { waiterCallReasonLabel } from "../waiter-calls/waiter-calls.service.js";
 
 const startOfToday = (): string => {
   const d = new Date();
@@ -805,6 +806,52 @@ export const updateTable = async (params: {
   return data;
 };
 
+/**
+ * `restaurant_alerts` has no free-text field of its own, so a waiter-call
+ * alert's reason lives one hop away, on the `waiter_calls` row it points at.
+ * Batch-resolve it here so the panel gets a ready-to-display Spanish label
+ * without a second round trip per alert.
+ */
+const attachWaiterCallReasonLabels = async (
+  alerts: Array<Record<string, unknown>>,
+): Promise<Array<Record<string, unknown>>> => {
+  const callIds = [
+    ...new Set(
+      alerts
+        .filter((a) => a["alert_type"] === "client_calling" && a["reference_type"] === "waiter_call")
+        .map((a) => a["reference_id"] as string | null)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  ];
+
+  if (callIds.length === 0) {
+    return alerts.map((a) => ({ ...a, reason_label: null }));
+  }
+
+  const { data, error } = await supabaseAdmin.from("waiter_calls").select("id, custom_reason").in("id", callIds);
+
+  if (error) {
+    // A lookup failure must not hide the alert itself - only its label.
+    logger.error({ err: error }, "waiter call reason lookup failed while labeling alerts");
+    return alerts.map((a) => ({ ...a, reason_label: null }));
+  }
+
+  const reasonById = new Map(
+    ((data ?? []) as Array<Record<string, unknown>>).map((row) => [
+      row["id"] as string,
+      (row["custom_reason"] as string | null) ?? null,
+    ]),
+  );
+
+  return alerts.map((a) => {
+    if (a["alert_type"] !== "client_calling" || a["reference_type"] !== "waiter_call") {
+      return { ...a, reason_label: null };
+    }
+    const code = reasonById.get(a["reference_id"] as string) ?? null;
+    return { ...a, reason_label: waiterCallReasonLabel(code) };
+  });
+};
+
 export const getAlerts = async (params: {
   branchId: string;
   status?: string;
@@ -834,14 +881,59 @@ export const getAlerts = async (params: {
   // see alerts targeted at their role; an absent/null target_role is treated
   // as visible to everyone. Filtering in JS keeps this safe whether or not a
   // target_role column is present on the row.
-  if (role === "admin" || role === "manager") {
-    return alerts;
+  const visible =
+    role === "admin" || role === "manager"
+      ? alerts
+      : alerts.filter((a) => {
+          const target = a["target_role"];
+          return target === null || target === undefined || target === role;
+        });
+
+  return attachWaiterCallReasonLabels(visible);
+};
+
+/**
+ * The branch name/address, open to any employee actually assigned to that
+ * branch - not just admins. Mirrors the employee_branches membership check
+ * used by session-actor.ts/expulsions.service.ts: an employee of another
+ * restaurant is a stranger here, same as everywhere else.
+ */
+export const getBranchInfo = async (params: { branchId: string; authUserId: string }): Promise<object> => {
+  const { branchId, authUserId } = params;
+
+  const employeeId = await resolveEmployeeId(authUserId);
+
+  const { data: assignment, error: assignmentError } = await supabaseAdmin
+    .from("employee_branches")
+    .select("branch_id")
+    .eq("employee_id", employeeId)
+    .eq("branch_id", branchId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (assignmentError) {
+    throw createError(assignmentError.message, 500, "BRANCH_LOOKUP_FAILED");
   }
 
-  return alerts.filter((a) => {
-    const target = a["target_role"];
-    return target === null || target === undefined || target === role;
-  });
+  if (!assignment) {
+    throw createError("You are not assigned to this branch", 403, "FORBIDDEN");
+  }
+
+  const { data: branch, error } = await supabaseAdmin
+    .from("branches")
+    .select("id, name, address")
+    .eq("id", branchId)
+    .maybeSingle();
+
+  if (error) {
+    throw createError(error.message, 500, "BRANCH_LOOKUP_FAILED");
+  }
+
+  if (!branch) {
+    throw createError("Branch not found", 404, "NOT_FOUND");
+  }
+
+  return branch;
 };
 
 export const updateAlert = async (params: {

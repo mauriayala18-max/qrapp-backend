@@ -4,14 +4,48 @@ import { logger } from "../../lib/logger.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
 import { assertSessionActive, loadSessionContext, resolveSeatProof } from "../sessions/session-actor.js";
 
+/**
+ * Fixed reason codes a caller may attach to a waiter call, and their Spanish
+ * panel labels.
+ *
+ * A `master_waiter_call_reasons` catalog table already exists (seeded with a
+ * different, open-ended set of diner-facing reasons: "Necesito ayuda", "Pedir
+ * la cuenta", etc. - managed generically by the admin catalog screens), but it
+ * has no notion of a stable machine-readable code and doesn't distinguish a
+ * cash payment request from a POS one. Rather than overload that catalog with
+ * operational codes it wasn't designed for, this fixed set lives in code and
+ * is stored as plain text in `custom_reason` (a column with no FK, already
+ * unused by any client today). `reason_id` / the catalog table are untouched.
+ */
+export const WAITER_CALL_REASONS: Record<string, string> = {
+  payment_cash: "Pedido de pago — Efectivo",
+  payment_pos: "Pedido de pago — POS",
+  supplies: "Salsas / cubiertos",
+  help: "Consulta / ayuda",
+};
+
+const WAITER_CALL_REASON_CODES = new Set(Object.keys(WAITER_CALL_REASONS));
+
+/** The Spanish label for a stored reason code, or null for a generic call. */
+export const waiterCallReasonLabel = (code: string | null | undefined): string | null =>
+  (code && WAITER_CALL_REASONS[code]) || null;
+
 export const callWaiter = async (params: {
   sessionId: string;
+  reason?: string;
   reason_id?: string;
-  custom_reason?: string;
   userId?: string;
   participantId?: string;
 }): Promise<object> => {
-  const { sessionId, reason_id, custom_reason, userId, participantId } = params;
+  const { sessionId, reason, reason_id, userId, participantId } = params;
+
+  if (reason !== undefined && !WAITER_CALL_REASON_CODES.has(reason)) {
+    throw createError(
+      `reason must be one of: ${[...WAITER_CALL_REASON_CODES].join(", ")}`,
+      400,
+      "INVALID_REASON",
+    );
+  }
 
   // Same identity rule as placing an order: the anonymous web seat proves
   // itself with its own participant_id (it has no account to log into), the
@@ -49,7 +83,7 @@ export const callWaiter = async (params: {
       branch_id: branchId,
       called_by: seat.participantId,
       reason_id: reason_id ?? null,
-      custom_reason: custom_reason ?? null,
+      custom_reason: reason ?? null,
       status: "pending",
       created_at: new Date().toISOString(),
     })
@@ -119,6 +153,7 @@ export const getBranchWaiterCalls = async (branchId: string): Promise<object[]> 
       participant_name: null,
       reason_id: call["reason_id"] ?? null,
       custom_reason: call["custom_reason"] ?? null,
+      reason_label: waiterCallReasonLabel(call["custom_reason"] as string | null),
       status: call["status"],
       elapsed_seconds: elapsed,
       created_at: call["created_at"],

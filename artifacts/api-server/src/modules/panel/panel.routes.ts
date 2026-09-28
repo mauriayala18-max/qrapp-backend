@@ -23,6 +23,7 @@ router.post("/branches/:branchId/waiter-assignments", authenticate, requireEmplo
 router.get("/branches/:branchId/clients", authenticate, requireEmployee, admin, panel.getClients);
 router.get("/clients/:userId/profile", authenticate, requireEmployee, admin, panel.getClientProfile);
 
+router.get("/branches/:branchId/info", authenticate, requireEmployee, panel.getBranchInfo);
 router.get("/branches/:branchId/settings", authenticate, requireEmployee, admin, panel.getBranchSettings);
 router.patch("/branches/:branchId/settings", authenticate, requireEmployee, admin, panel.updateBranchSettings);
 router.put("/branches/:branchId/hours", authenticate, requireEmployee, admin, panel.replaceBranchHours);
