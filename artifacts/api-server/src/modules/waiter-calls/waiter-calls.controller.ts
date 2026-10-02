@@ -9,16 +9,23 @@ export const callWaiter = async (
 ): Promise<void> => {
   try {
     const { sessionId } = req.params as { sessionId: string };
-    const { reason, reason_id, participant_id } = req.body as {
+    const { reason, reason_id, participant_id, detail, comment, note } = req.body as {
       reason?: string;
       reason_id?: string;
       participant_id?: string;
+      // The client's exact field name for the free-text detail wasn't confirmed against its
+      // source (not present in this workspace), so the three most likely names are all accepted;
+      // whichever arrives first (in this precedence) wins. See the report for follow-up.
+      detail?: string;
+      comment?: string;
+      note?: string;
     };
 
     const result = await waiterCallsService.callWaiter({
       sessionId,
       reason,
       reason_id,
+      detail: detail ?? comment ?? note,
       userId: req.user?.id,
       participantId: participant_id,
     });

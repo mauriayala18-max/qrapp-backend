@@ -5,7 +5,7 @@ import { supabaseAdmin } from "../../config/supabase.js";
 import { createError } from "../../middleware/errorHandler.js";
 import { resolveEmployeeId } from "../../lib/actors.js";
 import { logger } from "../../lib/logger.js";
-import { waiterCallReasonLabel } from "../waiter-calls/waiter-calls.service.js";
+import { parseWaiterCallReason } from "../waiter-calls/waiter-calls.service.js";
 
 const startOfToday = (): string => {
   const d = new Date();
@@ -825,7 +825,7 @@ const attachWaiterCallReasonLabels = async (
   ];
 
   if (callIds.length === 0) {
-    return alerts.map((a) => ({ ...a, reason_label: null }));
+    return alerts.map((a) => ({ ...a, reason_label: null, reason_detail: null }));
   }
 
   const { data, error } = await supabaseAdmin.from("waiter_calls").select("id, custom_reason").in("id", callIds);
@@ -833,10 +833,10 @@ const attachWaiterCallReasonLabels = async (
   if (error) {
     // A lookup failure must not hide the alert itself - only its label.
     logger.error({ err: error }, "waiter call reason lookup failed while labeling alerts");
-    return alerts.map((a) => ({ ...a, reason_label: null }));
+    return alerts.map((a) => ({ ...a, reason_label: null, reason_detail: null }));
   }
 
-  const reasonById = new Map(
+  const rawReasonById = new Map(
     ((data ?? []) as Array<Record<string, unknown>>).map((row) => [
       row["id"] as string,
       (row["custom_reason"] as string | null) ?? null,
@@ -845,10 +845,11 @@ const attachWaiterCallReasonLabels = async (
 
   return alerts.map((a) => {
     if (a["alert_type"] !== "client_calling" || a["reference_type"] !== "waiter_call") {
-      return { ...a, reason_label: null };
+      return { ...a, reason_label: null, reason_detail: null };
     }
-    const code = reasonById.get(a["reference_id"] as string) ?? null;
-    return { ...a, reason_label: waiterCallReasonLabel(code) };
+    const raw = rawReasonById.get(a["reference_id"] as string) ?? null;
+    const parsed = parseWaiterCallReason(raw);
+    return { ...a, reason_label: parsed.label, reason_detail: parsed.detail };
   });
 };
 

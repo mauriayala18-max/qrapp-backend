@@ -30,10 +30,58 @@ const WAITER_CALL_REASON_CODES = new Set(Object.keys(WAITER_CALL_REASONS));
 export const waiterCallReasonLabel = (code: string | null | undefined): string | null =>
   (code && WAITER_CALL_REASONS[code]) || null;
 
+/** Free-text detail is capped defensively - this is diner-typed input with no client-side limit we control. */
+const MAX_DETAIL_LENGTH = 500;
+
+export type ParsedWaiterCallReason = {
+  /** The fixed code (payment_cash/payment_pos/supplies/help), or null. */
+  code: string | null;
+  /** The Spanish label for `code`, or null for a generic/detail-only call. */
+  label: string | null;
+  /** Free-text elaboration the diner typed (all chosen reasons + their comment), or null. */
+  detail: string | null;
+};
+
+/**
+ * `waiter_calls` has exactly one spare text column (`custom_reason`), and now
+ * needs to carry two independent things: the fixed reason code (drives
+ * `reason_label`) and an optional free-text detail the diner typed. Both are
+ * packed into that one column as a small JSON object. Rows written before
+ * this change (and any row where only a code was ever given) are a bare code
+ * string, not JSON - `JSON.parse` on those throws, so the catch path treats
+ * the raw string as a legacy code with no detail. This keeps old rows and the
+ * panel's existing `reason_label` reads working unchanged.
+ */
+export const parseWaiterCallReason = (raw: string | null | undefined): ParsedWaiterCallReason => {
+  if (!raw) {
+    return { code: null, label: null, detail: null };
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      const code = typeof record["code"] === "string" ? (record["code"] as string) : null;
+      const detailRaw = typeof record["detail"] === "string" ? (record["detail"] as string).trim() : "";
+      return { code, label: waiterCallReasonLabel(code), detail: detailRaw || null };
+    }
+  } catch {
+    // Not JSON - legacy row written before free-text detail existed.
+  }
+
+  return { code: raw, label: waiterCallReasonLabel(raw), detail: null };
+};
+
+const encodeWaiterCallReason = (code: string | null, detail: string | null): string | null => {
+  if (!code && !detail) return null;
+  return JSON.stringify({ code, detail });
+};
+
 export const callWaiter = async (params: {
   sessionId: string;
   reason?: string;
   reason_id?: string;
+  detail?: string;
   userId?: string;
   participantId?: string;
 }): Promise<object> => {
@@ -45,6 +93,18 @@ export const callWaiter = async (params: {
       400,
       "INVALID_REASON",
     );
+  }
+
+  let detail: string | null = null;
+  if (params.detail !== undefined) {
+    if (typeof params.detail !== "string") {
+      throw createError("detail must be a string", 400, "INVALID_DETAIL");
+    }
+    const trimmed = params.detail.trim();
+    if (trimmed.length > MAX_DETAIL_LENGTH) {
+      throw createError(`detail must be at most ${MAX_DETAIL_LENGTH} characters`, 400, "INVALID_DETAIL");
+    }
+    detail = trimmed || null;
   }
 
   // Same identity rule as placing an order: the anonymous web seat proves
@@ -83,7 +143,7 @@ export const callWaiter = async (params: {
       branch_id: branchId,
       called_by: seat.participantId,
       reason_id: reason_id ?? null,
-      custom_reason: reason ?? null,
+      custom_reason: encodeWaiterCallReason(reason ?? null, detail),
       status: "pending",
       created_at: new Date().toISOString(),
     })
@@ -146,14 +206,19 @@ export const getBranchWaiterCalls = async (branchId: string): Promise<object[]> 
     const session = call["table_sessions"] as Record<string, unknown> | null;
     const table = session?.["tables"] as Record<string, unknown> | null;
 
+    const parsedReason = parseWaiterCallReason(call["custom_reason"] as string | null);
+
     return {
       id: call["id"],
       table_number: table?.["table_number"] ?? null,
       // `waiter_calls` stores only `called_by` (a user id), no display name.
       participant_name: null,
       reason_id: call["reason_id"] ?? null,
-      custom_reason: call["custom_reason"] ?? null,
-      reason_label: waiterCallReasonLabel(call["custom_reason"] as string | null),
+      // Kept as the plain fixed code (never the raw JSON storage encoding) for backward compatibility.
+      custom_reason: parsedReason.code,
+      reason_label: parsedReason.label,
+      // Free-text elaboration the diner typed (all chosen reasons + their comment), if any.
+      reason_detail: parsedReason.detail,
       status: call["status"],
       elapsed_seconds: elapsed,
       created_at: call["created_at"],
