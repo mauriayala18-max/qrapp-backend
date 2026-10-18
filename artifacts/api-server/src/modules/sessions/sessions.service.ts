@@ -12,6 +12,16 @@ import {
   type JoinMethod,
 } from "./session-access.js";
 import { assertNotExpelled } from "../expulsions/expulsion-guard.js";
+import {
+  generateSeatToken,
+  hashSeatToken,
+  isSeatTokenEnforced,
+  readPresentedSeatToken,
+  seatTokenColumnsReady,
+  seatTokenMatches,
+  stripSeatSecrets,
+  type IssuedSeatToken,
+} from "../../lib/seat-token.js";
 
 /**
  * Lazily open a session for a table that is currently free. A freed table has
@@ -167,11 +177,15 @@ const enterTableSession = async (params: {
   userId?: string;
   name?: string;
   knownSession?: Record<string, unknown> | null;
+  /** The X-Seat-Token the caller presented, if any. */
+  presentedSeatToken?: string | null;
 }): Promise<{
   session: Record<string, unknown>;
   participant: Record<string, unknown>;
   participants: Array<Record<string, unknown>>;
   openedNow: boolean;
+  /** Plaintext seat token, returned to this caller only. Null before the migration. */
+  seatToken: string | null;
   confirmation: Record<string, unknown>;
 }> => {
   const { table, method, platform, userId, name, knownSession } = params;
@@ -205,32 +219,55 @@ const enterTableSession = async (params: {
 
   const sessionId = session["id"] as string;
 
+  // Seat tokens are live only once their columns exist; before that, joining
+  // behaves exactly as it always has (see seatTokenColumnsReady).
+  const tokensReady = await seatTokenColumnsReady();
+  const presentedSeatToken = readPresentedSeatToken(params.presentedSeatToken ?? undefined);
+
+  // A guest who presents the valid token of a guest seat IN THIS SESSION is
+  // that seat - whatever name they typed this time. An invalid, foreign or
+  // stale token (e.g. from the table's previous session) counts as no token.
+  const tokenSeat =
+    !userId && tokensReady && presentedSeatToken
+      ? await findGuestSeatByToken(sessionId, presentedSeatToken)
+      : null;
+  const webName = tokenSeat ? ((tokenSeat["web_name"] as string | null) ?? name) : name;
+
   // A diner who was expelled from THIS session does not get back in, by QR or
   // by PIN. Checked before the participant row is touched, because rejoining
   // would otherwise just revive it.
-  await assertNotExpelled({ sessionId, userId, webName: name });
+  await assertNotExpelled({ sessionId, userId, webName });
 
-  const existingParticipant = await findParticipant(sessionId, userId, name);
+  const existingParticipant = userId
+    ? await findParticipant(sessionId, userId)
+    : tokenSeat ?? (await findGuestByNameForJoin(sessionId, webName, tokensReady));
 
   // Staff can seal a table; the diners already inside keep their access. A
-  // guest's typed name is not proof of being one of them, so only an
-  // authenticated diner can be readmitted to a locked table.
-  assertEntryAllowed(session, Boolean(existingParticipant && userId));
+  // guest's typed name is not proof of being one of them; their seat token
+  // is. So an authenticated diner, or a guest presenting their own seat's
+  // token, can be readmitted to a locked table - nobody else.
+  assertEntryAllowed(session, Boolean(existingParticipant && (userId || tokenSeat)));
+
+  // Every join hands out a fresh token: a first join, an app user rejoining
+  // (their JWT proves who they are, the old token stops working), and a guest
+  // who proved their seat with its token (rotated, same participant).
+  const issued = tokensReady ? generateSeatToken() : null;
 
   const participant = await upsertParticipant({
     sessionId,
     method,
     platform,
     userId,
-    name,
+    name: webName,
     existing: existingParticipant,
+    seatToken: issued,
   });
 
   // Checked again, now that the seat exists. An expulsion that landed between
   // the first check and this write would otherwise be undone by the revived
   // participant row, so the seat is taken away again before answering.
   try {
-    await assertNotExpelled({ sessionId, userId, webName: name });
+    await assertNotExpelled({ sessionId, userId, webName });
   } catch (err) {
     await supabaseAdmin
       .from("session_participants")
@@ -246,14 +283,16 @@ const enterTableSession = async (params: {
     .select("*")
     .eq("session_id", sessionId);
 
-  const participants = (participantRows ?? []) as Array<Record<string, unknown>>;
+  // The hash never leaves the server - not the caller's, not anyone else's.
+  const participants = ((participantRows ?? []) as Array<Record<string, unknown>>).map(stripSeatSecrets);
   const restaurant = branch?.["restaurants"] as Record<string, unknown> | null;
 
   return {
     session,
-    participant,
+    participant: stripSeatSecrets(participant),
     participants,
     openedNow,
+    seatToken: issued?.token ?? null,
     confirmation: {
       session_id: sessionId,
       session_opened_now: openedNow,
@@ -266,6 +305,9 @@ const enterTableSession = async (params: {
         : null,
       restaurant_name: restaurant?.["name"] ?? null,
       participant_id: participant["id"],
+      // Shown ONCE. Send it back as the X-Seat-Token header on every diner
+      // write (see docs/seat-token.md). Null until the migration is run.
+      seat_token: issued?.token ?? null,
       participants,
     },
   };
@@ -368,6 +410,85 @@ const findParticipant = async (
   return ((data ?? [])[0] as Record<string, unknown> | undefined) ?? null;
 };
 
+/** Returned when a guest picks a name another seat at this table already holds. */
+const nameTaken = (): Error =>
+  createError(
+    "That name is already in use at this table. Choose a different name.",
+    409,
+    "NAME_TAKEN",
+  );
+
+/**
+ * The guest seat a presented seat token belongs to, in THIS session only.
+ * Account seats are not reachable this way: they rejoin with their JWT.
+ */
+const findGuestSeatByToken = async (
+  sessionId: string,
+  token: string,
+): Promise<Record<string, unknown> | null> => {
+  const { data, error } = await supabaseAdmin
+    .from("session_participants")
+    .select("*")
+    .eq("session_id", sessionId)
+    .eq("seat_token_hash", hashSeatToken(token))
+    .limit(1);
+
+  if (error) {
+    throw createError(error.message, 500, "PARTICIPANT_LOOKUP_FAILED");
+  }
+
+  const row = ((data ?? [])[0] as Record<string, unknown> | undefined) ?? null;
+
+  if (!row || row["user_id"] != null) return null;
+  if (!seatTokenMatches(token, (row["seat_token_hash"] as string | null) ?? null)) return null;
+
+  return row;
+};
+
+/**
+ * A guest joining WITHOUT a valid seat token, under a name that some seat of
+ * this session already holds.
+ *
+ * With seat tokens live, a typed name proves nothing, so that seat is never
+ * handed over: the guest gets 409 NAME_TAKEN and must pick another name. A new
+ * row with the same name is not an option either - the unique index
+ * `session_participants_one_per_guest (session_id, web_name)` forbids it, and
+ * two identical names at one table would be indistinguishable to everyone.
+ *
+ * Before the migration, or with SEAT_TOKEN_ENFORCE=false, the old behaviour
+ * (revive the seat with that name) is kept so a rollback is complete.
+ */
+const findGuestByNameForJoin = async (
+  sessionId: string,
+  webName: string | undefined,
+  tokensReady: boolean,
+): Promise<Record<string, unknown> | null> => {
+  const sameName = await findParticipant(sessionId, undefined, webName);
+
+  if (!sameName) return null;
+
+  if (tokensReady && isSeatTokenEnforced()) {
+    logger.warn(
+      {
+        session_id: sessionId,
+        participant_id: sameName["id"],
+        holder_active: sameName["disconnected_at"] == null,
+      },
+      "guest join refused: name already held by another seat",
+    );
+    throw nameTaken();
+  }
+
+  if (tokensReady) {
+    logger.warn(
+      { session_id: sessionId, participant_id: sameName["id"] },
+      "guest rejoined by name without a seat token (SEAT_TOKEN_ENFORCE=false: allowed)",
+    );
+  }
+
+  return sameName;
+};
+
 /**
  * Add the diner to the session, or bring their existing row back to life.
  * Rejoining is not a new seat at the table.
@@ -379,9 +500,16 @@ const upsertParticipant = async (params: {
   userId?: string;
   name?: string;
   existing: Record<string, unknown> | null;
+  /** Fresh token to store (hash only). Null before the migration is run. */
+  seatToken: IssuedSeatToken | null;
 }): Promise<Record<string, unknown>> => {
-  const { sessionId, method, platform, userId, name, existing } = params;
+  const { sessionId, method, platform, userId, name, existing, seatToken } = params;
   const now = new Date().toISOString();
+
+  // Only the hash is persisted; writing it replaces (= revokes) any old token.
+  const tokenColumns: Record<string, unknown> = seatToken
+    ? { seat_token_hash: seatToken.hash, seat_token_issued_at: seatToken.issuedAt }
+    : {};
 
   if (existing) {
     const { data, error } = await supabaseAdmin
@@ -391,6 +519,7 @@ const upsertParticipant = async (params: {
         connection_method: method,
         connected_at: now,
         disconnected_at: null,
+        ...tokenColumns,
       })
       .eq("id", existing["id"] as string)
       .select("*")
@@ -409,6 +538,7 @@ const upsertParticipant = async (params: {
     connection_method: method,
     joined_at: now,
     connected_at: now,
+    ...tokenColumns,
   };
 
   if (userId) {
@@ -424,12 +554,26 @@ const upsertParticipant = async (params: {
     .single();
 
   if (error) {
-    // Two devices joining in the same instant: the unique index rejects the
-    // loser, whose row now exists anyway. Read it back instead of failing a
-    // join that effectively succeeded.
+    // Two joins in the same instant: the unique index rejects the loser,
+    // whose row now exists anyway.
     if (error.code === "23505") {
       const raced = await findParticipant(sessionId, userId, name);
-      if (raced) return raced;
+
+      if (raced) {
+        // Same account on two devices: their JWT proves the seat is theirs,
+        // so take it over with this join's token (the other device's stops).
+        if (userId) {
+          return upsertParticipant({ ...params, existing: raced });
+        }
+
+        // Two guests typing the same name: the name is not proof, so the
+        // second one does NOT get the first one's seat.
+        if (seatToken && isSeatTokenEnforced()) {
+          throw nameTaken();
+        }
+
+        return raced;
+      }
     }
 
     throw createError(error.message, 500, "PARTICIPANT_CREATE_FAILED");
@@ -477,8 +621,9 @@ export const joinSession = async (params: {
   name?: string;
   platform: "app" | "web";
   userId?: string;
+  presentedSeatToken?: string | null;
 }): Promise<object> => {
-  const { token, pin, name, platform, userId } = params;
+  const { token, pin, name, platform, userId, presentedSeatToken } = params;
 
   if (!token && !pin) {
     throw createError("token or pin is required", 400, "MISSING_FIELDS");
@@ -504,6 +649,7 @@ export const joinSession = async (params: {
     userId,
     name,
     knownSession: credentialSession,
+    presentedSeatToken,
   });
 
   return confirmation;
@@ -520,8 +666,9 @@ export const scanTable = async (params: {
   platform: "app" | "web";
   name?: string;
   userId?: string;
+  presentedSeatToken?: string | null;
 }): Promise<object> => {
-  const { tableId, platform, name, userId } = params;
+  const { tableId, platform, name, userId, presentedSeatToken } = params;
 
   if (!userId && !name) {
     throw createError("name is required for guest users", 400, "MISSING_FIELDS");
@@ -544,6 +691,7 @@ export const scanTable = async (params: {
     platform,
     userId,
     name,
+    presentedSeatToken,
   });
 
   return confirmation;
@@ -554,8 +702,9 @@ export const scanAndJoin = async (params: {
   platform: "app" | "web";
   name?: string;
   userId?: string;
+  presentedSeatToken?: string | null;
 }): Promise<object> => {
-  const { token, platform, name, userId } = params;
+  const { token, platform, name, userId, presentedSeatToken } = params;
 
   const { data: table, error: tableError } = await supabaseAdmin
     .from("tables")
@@ -571,12 +720,18 @@ export const scanAndJoin = async (params: {
     throw createError("name is required for guest users", 400, "MISSING_FIELDS");
   }
 
-  const { session: enteredSession, participants: sessionParticipants } = await enterTableSession({
+  const {
+    session: enteredSession,
+    participant: enteredParticipant,
+    participants: sessionParticipants,
+    seatToken,
+  } = await enterTableSession({
     table: table as Record<string, unknown>,
     method: "qr",
     platform,
     userId,
     name,
+    presentedSeatToken,
   });
 
   const activeSession = enteredSession as unknown as { id: string; status: string };
@@ -636,6 +791,9 @@ export const scanAndJoin = async (params: {
     menu: categories ?? [],
     orders: orders ?? [],
     participants: sessionParticipants,
+    participant_id: enteredParticipant["id"],
+    // Shown ONCE - see docs/seat-token.md. Null until the migration is run.
+    seat_token: seatToken,
     promotions: promotions ?? [],
     banking_benefits: bankingBenefits,
   };

@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { createError } from "../../middleware/errorHandler.js";
 import * as sessionsService from "../sessions/sessions.service.js";
+import { SEAT_TOKEN_HEADER } from "../../lib/seat-token.js";
 
 /**
  * POST /api/v1/tables/:tableId/scan
@@ -30,6 +31,7 @@ export const scanTable = async (
       platform,
       ...(name ? { name } : {}),
       ...(req.user?.id ? { userId: req.user.id } : {}),
+      presentedSeatToken: req.get(SEAT_TOKEN_HEADER),
     });
 
     res.json({ data: result });

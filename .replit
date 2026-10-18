@@ -38,3 +38,10 @@ externalPort = 3001
 
 [nix]
 channel = "stable-25_05"
+
+[userenv]
+
+[userenv.development]
+
+[userenv.production]
+SEAT_TOKEN_ENFORCE = "false"

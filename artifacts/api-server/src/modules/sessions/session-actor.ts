@@ -75,7 +75,7 @@ export const assertSessionActive = (session: SessionContext): void => {
 };
 
 /** The staff row for this auth user, if they are one and are assigned here. */
-const resolveStaff = async (
+export const resolveStaff = async (
   authUserId: string,
   branchId: string,
 ): Promise<{ employeeId: string; role: string } | null> => {

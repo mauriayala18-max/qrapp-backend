@@ -7,6 +7,7 @@ import {
   resolveSessionReadAccess,
 } from "./session-actor.js";
 import * as sessionLockService from "./session-lock.service.js";
+import { SEAT_TOKEN_HEADER } from "../../lib/seat-token.js";
 
 export const joinSession = async (
   req: Request,
@@ -31,6 +32,8 @@ export const joinSession = async (
       name,
       platform,
       userId: req.user?.id,
+      // A guest proves which seat is theirs on rejoin with its seat token.
+      presentedSeatToken: req.get(SEAT_TOKEN_HEADER),
     });
 
     res.json({ data: result });
@@ -64,6 +67,7 @@ export const scanAndJoin = async (
       platform,
       name,
       userId: req.user?.id,
+      presentedSeatToken: req.get(SEAT_TOKEN_HEADER),
     });
 
     res.json({ data: result });

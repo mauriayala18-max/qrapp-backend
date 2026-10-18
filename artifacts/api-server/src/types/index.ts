@@ -31,10 +31,29 @@ export interface AuthenticatedUser {
   role: string;
 }
 
+/** The diner a seat-protected request acts as, proven by `requireSeat`. */
+export interface SeatParticipant {
+  id: string;
+  session_id: string;
+  user_id: string | null;
+  web_name: string | null;
+  platform: string | null;
+}
+
+/** Branch staff let through a seat-protected route that also serves staff. */
+export interface SeatStaff {
+  employeeId: string;
+  role: string;
+}
+
 declare global {
   namespace Express {
     interface Request {
       user?: AuthenticatedUser;
+      /** Set by `requireSeat` - never derived from the request body. */
+      participant?: SeatParticipant;
+      /** Set by `requireSeat` when a route allows staff and the caller is one. */
+      seatStaff?: SeatStaff;
     }
   }
 }

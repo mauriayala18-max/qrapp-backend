@@ -27,7 +27,8 @@ export const callWaiter = async (
       reason_id,
       detail: detail ?? comment ?? note,
       userId: req.user?.id,
-      participantId: participant_id,
+      // The seat proven by X-Seat-Token wins over the body (see requireSeat).
+      participantId: req.participant?.id ?? participant_id,
     });
 
     res.status(201).json({ data: result });

@@ -23,9 +23,11 @@ export const createOrder = async (
       session_id,
       items: items as Parameters<typeof ordersService.createOrder>[0]["items"],
       notes,
-      // Who the caller CLAIMS to be. The service verifies the seat against the
-      // session before a single row is written.
-      participant_id: participant_id ?? undefined,
+      // The seat proven by X-Seat-Token wins over anything in the body. The
+      // body id is only consulted when tokens are not in force (columns not
+      // migrated yet, or SEAT_TOKEN_ENFORCE=false); the service then verifies
+      // that claimed seat against the session before a single row is written.
+      participant_id: req.participant?.id ?? participant_id ?? undefined,
       auth_user_id: req.user?.id,
     });
 

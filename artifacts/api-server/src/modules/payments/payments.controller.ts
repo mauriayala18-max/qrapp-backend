@@ -42,7 +42,8 @@ export const createPayment = async (
       tip_type,
       billing_profile_id,
       userId: req.user?.id,
-      isEmployee: req.body["_isEmployee"] as boolean ?? false,
+      // Verified by requireSeat against the session's branch - never a body flag.
+      isEmployee: Boolean(req.seatStaff),
     });
 
     res.status(201).json({ data: result });
